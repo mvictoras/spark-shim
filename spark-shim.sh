@@ -29,6 +29,7 @@ nothing installed -- they just use the shared configs.
 Usage:
     spark-shim                  # connect + configure opencode & codex
     spark-shim --publish        # ALCF login node: socat relay for compute nodes
+    spark-shim --gateway h:p    # target a different gateway endpoint
     spark-shim --claude         # ...and repoint Claude Code (displaces argo)
     spark-shim --status         # what's running, what's configured
     spark-shim --test           # real round-trip on both protocols
@@ -57,8 +58,11 @@ import urllib.request
 SSH_HOST = "titan"
 SSH_JUMP = "login-gce"
 REMOTE_BIND = "127.0.0.1"   # gateway listens on 0.0.0.0, but loopback-from-titan
-REMOTE_PORT = 4000          # is the shortest path once we're on the box
-DIRECT_HOST = "titan.alcf.anl.gov"
+                            # is the shortest path once we're on the box
+DEFAULT_GATEWAY_HOST = "titan.alcf.anl.gov"
+DEFAULT_GATEWAY_PORT = 4000
+GATEWAY_HOST = DEFAULT_GATEWAY_HOST   # override with --gateway or $SPARK_GATEWAY
+GATEWAY_PORT = DEFAULT_GATEWAY_PORT
 
 DEFAULT_PORT = 4100
 FALLBACK_KEY = "sk-spark-anl-c72183474362a422"
@@ -120,15 +124,43 @@ def gateway_responds(host, port, api_key, timeout=8):
 
 def detect_direct(api_key):
     """True when the gateway is reachable without a tunnel (i.e. on ALCF net)."""
-    if not port_open(DIRECT_HOST, REMOTE_PORT, timeout=3.0):
+    if not port_open(GATEWAY_HOST, GATEWAY_PORT, timeout=3.0):
         return False
-    return gateway_responds(DIRECT_HOST, REMOTE_PORT, api_key)
+    return gateway_responds(GATEWAY_HOST, GATEWAY_PORT, api_key)
+
+
+def apply_gateway(spec):
+    """Point GATEWAY_HOST/GATEWAY_PORT at `spec` ("host[:port]", scheme optional)."""
+    global GATEWAY_HOST, GATEWAY_PORT
+    spec = spec.strip()
+    for scheme in ("http://", "https://"):
+        if spec.startswith(scheme):
+            spec = spec[len(scheme):]
+            break
+    spec = spec.rstrip("/")
+    host, _, port = spec.partition(":")
+    if not host or (port and not port.isdigit()):
+        die(f"Invalid gateway endpoint {spec!r} (expected host[:port])")
+    GATEWAY_HOST = host
+    GATEWAY_PORT = int(port) if port else DEFAULT_GATEWAY_PORT
 
 
 # --- tunnel lifecycle -------------------------------------------------------
 
+def tunnel_dest():
+    """Where the ssh-side end of the -L forward points.
+
+    Default is the gateway's loopback on the jump box (shortest path); a
+    --gateway override reroutes the far end to the configured host instead.
+    """
+    if GATEWAY_HOST != DEFAULT_GATEWAY_HOST:
+        return GATEWAY_HOST, GATEWAY_PORT
+    return REMOTE_BIND, GATEWAY_PORT
+
+
 def forward_spec(port):
-    return f"{port}:{REMOTE_BIND}:{REMOTE_PORT}"
+    dest_host, dest_port = tunnel_dest()
+    return f"{port}:{dest_host}:{dest_port}"
 
 
 def tunnel_pids(port):
@@ -341,7 +373,8 @@ def start_tunnel(port, api_key):
         "-L", f"127.0.0.1:{forward_spec(port)}",
         SSH_HOST,
     ]
-    say(f"  Opening tunnel 127.0.0.1:{port} {DOT} {SSH_HOST}:{REMOTE_PORT} via {SSH_JUMP}")
+    dest_host, dest_port = tunnel_dest()
+    say(f"  Opening tunnel 127.0.0.1:{port} {DOT} {dest_host}:{dest_port} via {SSH_JUMP}")
     # `ssh -f` forks a daemon that inherits whatever stdout/stderr it is given.
     # Any pipe therefore stays open for the life of the tunnel, so a caller
     # reading that pipe (a script, a subshell, $(...)) hangs forever -- and
@@ -370,7 +403,7 @@ def start_tunnel(port, api_key):
         stop_tunnel(port, quiet=True)
         die(f"Tunnel opened but the gateway did not answer.\n"
             f"  Is LiteLLM still up?  ssh -J {SSH_JUMP} {SSH_HOST} "
-            f"'curl -s localhost:{REMOTE_PORT}/v1/models'")
+            f"'curl -s localhost:{GATEWAY_PORT}/v1/models'")
     say(f"  {OK} Tunnel up and gateway responding")
 
 
@@ -588,13 +621,13 @@ def show_status(port, api_key, key_source):
     else:
         say(f"  Relay 0.0.0.0      {DOT} not running on port {port}")
 
-    direct = port_open(DIRECT_HOST, REMOTE_PORT, timeout=3.0)
+    direct = port_open(GATEWAY_HOST, GATEWAY_PORT, timeout=3.0)
     say(f"  ALCF network       {OK + ' yes (direct path available)' if direct else DOT + ' no (off-site, tunnel required)'}")
 
     for label, url in (("via tunnel", f"http://127.0.0.1:{port}"),
-                       ("direct", f"http://{DIRECT_HOST}:{REMOTE_PORT}")):
-        host = DIRECT_HOST if label == "direct" else "127.0.0.1"
-        prt = REMOTE_PORT if label == "direct" else port
+                       ("direct", f"http://{GATEWAY_HOST}:{GATEWAY_PORT}")):
+        host = GATEWAY_HOST if label == "direct" else "127.0.0.1"
+        prt = GATEWAY_PORT if label == "direct" else port
         live = gateway_responds(host, prt, api_key, timeout=5)
         say(f"  Gateway {label:<10} {OK if live else DOT} {url}")
 
@@ -634,6 +667,9 @@ def main():
     )
     parser.add_argument("--port", type=int, default=int(os.environ.get("SPARK_SHIM_PORT", DEFAULT_PORT)),
                         help=f"local port for the tunnel (default: {DEFAULT_PORT})")
+    parser.add_argument("--gateway", default=None, metavar="HOST[:PORT]",
+                        help="gateway endpoint override (default: titan.alcf.anl.gov:4000); "
+                             "scheme optional, also settable via $SPARK_GATEWAY")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--direct", action="store_true",
                       help="force direct connection, skip the tunnel (ALCF network only)")
@@ -655,6 +691,11 @@ def main():
                         help="run real round-trip tests on both wire protocols")
     args = parser.parse_args()
 
+    gateway_spec = args.gateway or os.environ.get("SPARK_GATEWAY")
+    if gateway_spec:
+        apply_gateway(gateway_spec)
+        say(f"  {DOT} Gateway override: {GATEWAY_HOST}:{GATEWAY_PORT}")
+
     api_key, key_source = resolve_api_key()
 
     if args.restore_claude:
@@ -673,7 +714,7 @@ def main():
     if args.publish:
         say("Publish mode: relaying the gateway for ALCF compute nodes...")
         if not detect_direct(api_key):
-            die(f"{DIRECT_HOST}:{REMOTE_PORT} is not reachable from here.\n"
+            die(f"{GATEWAY_HOST}:{GATEWAY_PORT} is not reachable from here.\n"
                 "  --publish belongs on an ALCF login node; compute nodes only "
                 "consume the configs it writes.")
         use_tunnel = False
@@ -684,7 +725,7 @@ def main():
     else:
         say("Locating the gateway...")
         direct = detect_direct(api_key)
-        say(f"  {OK if direct else DOT} {DIRECT_HOST}:{REMOTE_PORT} "
+        say(f"  {OK if direct else DOT} {GATEWAY_HOST}:{GATEWAY_PORT} "
             f"{'reachable directly (on ALCF network)' if direct else 'unreachable (off-site)'}")
         use_tunnel = not direct
         if direct:
@@ -692,20 +733,20 @@ def main():
                 f"login node, run: spark-shim --publish")
 
     if args.publish:
-        start_relay(args.port, DIRECT_HOST, REMOTE_PORT)
+        start_relay(args.port, GATEWAY_HOST, GATEWAY_PORT)
         if not gateway_responds("127.0.0.1", args.port, api_key):
             stop_relay(args.port, quiet=True)
             die("Relay is up but the gateway did not answer through it.")
         hostname = socket.gethostname()
         base_url = f"http://{hostname}:{args.port}"
-        say(f"  {OK} Relay published: {hostname}:{args.port} {DOT} {DIRECT_HOST}:{REMOTE_PORT}")
+        say(f"  {OK} Relay published: {hostname}:{args.port} {DOT} {GATEWAY_HOST}:{GATEWAY_PORT}")
     elif use_tunnel:
         start_tunnel(args.port, api_key)
         base_url = f"http://127.0.0.1:{args.port}"
     else:
-        base_url = f"http://{DIRECT_HOST}:{REMOTE_PORT}"
-        if not gateway_responds(DIRECT_HOST, REMOTE_PORT, api_key):
-            die(f"--direct requested but {DIRECT_HOST}:{REMOTE_PORT} is not answering.\n"
+        base_url = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
+        if not gateway_responds(GATEWAY_HOST, GATEWAY_PORT, api_key):
+            die(f"--direct requested but {GATEWAY_HOST}:{GATEWAY_PORT} is not answering.\n"
                 f"  Drop --direct (or pass --tunnel) to hop through {SSH_JUMP}.")
         say(f"  {OK} Using direct connection, no tunnel needed")
 

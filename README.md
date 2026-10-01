@@ -32,6 +32,21 @@ duplicated here, so fixing SSH in one place fixes it everywhere.
 
 `--port` overrides the port (default 4100, or `$SPARK_SHIM_PORT`).
 
+## Endpoint override
+
+The gateway endpoint defaults to `titan.alcf.anl.gov:4000`. Point the whole
+tool at a different one with:
+
+    spark-shim --gateway llm.example.org:8000
+    spark-shim --gateway http://llm.example.org:8000   # scheme optional
+    SPARK_GATEWAY=llm.example.org:8000 spark-shim      # same thing via env
+
+Every mode follows the override: reachability detection, the direct base
+URL, the tunnel's far end, and the `--publish` relay destination. The SSH
+path itself (the `titan`/`login-gce` aliases) is unchanged — edit
+`~/.ssh/config` for that. The CLI flag wins over the environment variable;
+port defaults to 4000 when omitted.
+
 ## ALCF compute-node recipe
 
 ALCF compute nodes cannot reach titan (or the internet) directly. On a
