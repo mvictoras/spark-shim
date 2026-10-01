@@ -52,9 +52,11 @@ import urllib.error
 import urllib.request
 
 # --- topology ---------------------------------------------------------------
-# `titan` and `login-gce` are ssh_config aliases, NOT hostnames. Usernames,
-# keys and the ProxyJump chain live in ~/.ssh/config and are deliberately not
-# duplicated here, so fixing SSH in one place fixes it everywhere.
+# `titan` and `login-gce` are ssh_config aliases, NOT hostnames. Their
+# usernames and keys live in ~/.ssh/config. The `titan` alias itself has no
+# ProxyJump: the off-site tunnel passes `-J login-gce` explicitly, so this
+# script -- not the config -- supplies that hop. Only the off-site tunnel
+# uses SSH at all; the ALCF paths are direct TCP (socat) or nothing.
 SSH_HOST = "titan"
 SSH_JUMP = "login-gce"
 REMOTE_BIND = "127.0.0.1"   # gateway listens on 0.0.0.0, but loopback-from-titan

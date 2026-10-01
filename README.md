@@ -15,9 +15,11 @@ config to point at it.
     ALCF login   ->  titan.alcf.anl.gov:4000  (direct, no tunnel)
     ALCF compute ->  http://<login-node>:4100  (socat relay via --publish)
 
-`titan` and `login-gce` are ssh_config aliases, not hostnames. Usernames,
-keys and the ProxyJump chain live in `~/.ssh/config` and are deliberately not
-duplicated here, so fixing SSH in one place fixes it everywhere.
+`titan` and `login-gce` are ssh_config aliases, not hostnames. Usernames and
+keys live in `~/.ssh/config`. The `titan` alias itself carries no ProxyJump —
+the off-site tunnel passes `-J login-gce` explicitly, so that hop is supplied
+by this script, not the config. Only the off-site mode uses SSH at all: the
+ALCF paths are direct TCP (relay) or nothing.
 
 ## Usage
 
