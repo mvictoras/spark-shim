@@ -13,13 +13,17 @@ network. On the ALCF network you can hit it directly; from home you must hop
 through the CELS gateway. SSH handles that fine, but opencode/claude/codex
 speak HTTP, not SSH.
 
-This script bridges that gap: it puts a plain local TCP port in front of the
-gateway and rewrites each client's config to point at it.
+This script bridges that gap: clients always talk to a stable local address
+(http://127.0.0.1:4100), and spark-shim decides what listens there.
 
-    home (VPN)   ->  titan.alcf.anl.gov:4000  (direct, no tunnel)
-    home (off-site) ->  127.0.0.1:4100  ==ssh -J login-gce==>  titan:4000
+    lab / VPN    ->  127.0.0.1:4100 ==python relay==> titan.alcf.anl.gov:4000
+    home (off-site) ->  127.0.0.1:4100 ==ssh -J login-gce==>  titan:4000
     ALCF login   ->  0.0.0.0:4100 ==ssh -J logins.cels==> titan:4000  (MFA once)
     ALCF compute ->  http://<login-node>:4100  (relay via --publish)
+
+One probe (a TCP connect to the gateway plus an authenticated /v1/models)
+decides lab vs. away. Away, it also keeps a tunnel to the Hermes dashboard
+on vr09 (127.0.0.1:9119); at the lab vr09 is reached without one.
 
 ALCF compute nodes cannot reach titan at all -- and neither can ALCF login
 nodes (every port to the DGX is filtered from the compute-center zone), so
@@ -36,15 +40,14 @@ binds 0.0.0.0 and rewrites the shared-home client configs to
 the shared configs.
 
 Usage:
-    spark-shim                  # connect + configure opencode & codex
+    spark-shim                  # connect + configure opencode & hermes
     spark-shim --publish        # login node: relay the gateway for compute nodes
     spark-shim --gateway h:p    # target a different gateway endpoint
-    spark-shim --claude         # ...and repoint Claude Code (displaces argo)
+    spark-shim --where          # print "lab" or "away" (exit 0 / 1) and stop
     spark-shim --status         # what's running, what's configured
     spark-shim --test           # real round-trip on both protocols
     spark-shim --models         # list models the gateway is serving
-    spark-shim --stop           # tear the tunnel/relay down
-    spark-shim --restore-claude # put argo's Claude Code settings back
+    spark-shim --stop           # tear the tunnels/relays down
 """
 
 import argparse
