@@ -271,6 +271,24 @@ class CLITestCase(unittest.TestCase):
 
     # -- Codex cleanup and Claude leftovers ----------------------------------
 
+    def test_removed_flags_rejected_as_unknown(self):
+        mod = self.load(lab=True)
+        for flag in ("--claude", "--no-codex", "--restore-claude"):
+            with self.subTest(flag=flag):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as ctx:
+                        mod.main([flag])
+                self.assertEqual(ctx.exception.code, 2)  # argparse usage error
+
+    def test_claude_settings_left_alone(self):
+        mod = self.load(lab=True)
+        claude_settings = self.tmp / ".claude/settings.json"
+        write_json(claude_settings, {"env": {"ANTHROPIC_BASE_URL": "https://argo"}})
+        original = claude_settings.read_text()
+        self.run_main(mod)
+        self.assertEqual(claude_settings.read_text(), original)
+        self.assertEqual(list((self.tmp / ".claude").glob("*")), [claude_settings])
+
     def test_old_codex_block_stripped_with_backup(self):
         mod = self.load(lab=True)
         self.codex_config.parent.mkdir(parents=True, exist_ok=True)

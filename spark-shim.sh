@@ -4,8 +4,8 @@
 Unlike argo-shim, this needs no HTTP translation proxy. The LiteLLM gateway on
 titan:4000 already speaks BOTH wire protocols natively:
 
-    /v1/chat/completions   OpenAI    -> opencode, codex
-    /v1/messages           Anthropic -> claude code (streaming SSE included)
+    /v1/chat/completions   OpenAI wire protocol
+    /v1/messages           Anthropic wire protocol (streaming SSE included)
 
 So the only real problem is reachability: `titan.alcf.anl.gov` is an
 internal-only name (NXDOMAIN off-site), and the gateway binds a private
