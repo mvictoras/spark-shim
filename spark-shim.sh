@@ -1091,15 +1091,19 @@ def hermes_tunnel_pids():
 def hermes_tunnel_healthy():
     """True if the Hermes forward actually carries traffic.
 
-    Judged by making an HTTP request through the forward: ANY HTTP response
-    counts (the dashboard may 401/redirect), while a refusal, close or
-    timeout means the tunnel is a hung leftover -- exactly what a laptop
-    sleep leaves behind.
+    Judged by making an HTTP request through the forward: ANY response
+    counts (the dashboard may 401 or redirect), while a refusal, a close
+    with no data, or a timeout means the tunnel is a hung leftover --
+    exactly what a laptop sleep leaves behind. A bare TCP connect is NOT
+    enough: ssh's local listener accepts connections even when the far end
+    is unreachable, which would report a dead forward as healthy.
     """
     try:
-        with socket.create_connection(("127.0.0.1", HERMES_TUNNEL_PORT), timeout=3):
-            pass  # an open forward is already answering
-        return True
+        with socket.create_connection(
+            ("127.0.0.1", HERMES_TUNNEL_PORT), timeout=3
+        ) as s:
+            s.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            return bool(s.recv(256))
     except OSError:
         return False
 
@@ -1266,6 +1270,20 @@ def update_opencode(base_url, api_key, discovered=()):
     return merged
 
 
+def strip_managed_block(text, begin, end):
+    """Remove the marker-delimited block `begin`…`end` from `text`, if present.
+
+    [ \\t]* on both ends: the markers may be indented, and the indentation
+    must go with them or the surrounding lines shift.
+    """
+    return re.sub(
+        r"[ \t]*" + re.escape(begin) + r".*?" + re.escape(end) + r"[ \t]*\n?",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+
+
 def timestamped_backup(path, dest_dir=None):
     """Copy `path` to a timestamped backup; never overwrite an earlier one.
 
@@ -1301,16 +1319,7 @@ def strip_codex_block():
         return
     if CODEX_BEGIN not in text:
         return
-    cleaned = (
-        re.sub(
-            r"[ \t]*" + re.escape(CODEX_BEGIN) + r".*?" + re.escape(CODEX_END)
-            + r"[ \t]*\n?",
-            "",
-            text,
-            flags=re.DOTALL,
-        ).rstrip("\n")
-        + "\n"
-    )
+    cleaned = strip_managed_block(text, CODEX_BEGIN, CODEX_END).rstrip("\n") + "\n"
     backup = timestamped_backup(CODEX_CONFIG, dest_dir=STATE_DIR)
     with open(CODEX_CONFIG, "w") as fh:
         fh.write(cleaned)
@@ -1368,15 +1377,7 @@ def update_hermes(base_url, api_key, opencode_models):
         model_contexts[model_id] = ctx
 
     # Strip any block we manage already, wherever it currently sits.
-    # [ \t]* on both ends: markers may be indented, and the indentation must
-    # go with them or the surrounding lines shift.
-    without = re.sub(
-        r"[ \t]*" + re.escape(HERMES_BEGIN) + r".*?" + re.escape(HERMES_END)
-        + r"[ \t]*\n?",
-        "",
-        text,
-        flags=re.DOTALL,
-    )
+    without = strip_managed_block(text, HERMES_BEGIN, HERMES_END)
 
     section = re.compile(r"^custom_providers:[ \t]*(?:#.*)?$", re.MULTILINE)
     match = section.search(without)
@@ -1677,6 +1678,9 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    # --direct/--tunnel are manual overrides of the lab/away probe.
+    override = "direct" if args.direct else ("tunnel" if args.tunnel else None)
+
     gateway_spec = args.gateway or os.environ.get("SPARK_GATEWAY")
     if gateway_spec:
         apply_gateway(gateway_spec)
@@ -1692,7 +1696,6 @@ def main(argv=None):
     api_key, key_source = resolve_api_key()
 
     if args.where:
-        override = "direct" if args.direct else ("tunnel" if args.tunnel else None)
         location = decide_location(api_key, override)
         say(location)
         sys.exit(0 if location == "lab" else 1)
@@ -1716,7 +1719,6 @@ def main(argv=None):
         location = "publish"
         direct = detect_direct(api_key)
     else:
-        override = "direct" if args.direct else ("tunnel" if args.tunnel else None)
         if override is None:
             say("Locating the gateway...")
             direct = detect_direct(api_key)

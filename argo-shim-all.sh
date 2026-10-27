@@ -51,23 +51,27 @@ mkdir -p "$STATE_DIR"
 #    by the output, never by the status.
 where=$("$SPARK_SHIM" --where 2>/dev/null)
 
+# The shim runs forever, so it is backgrounded with a log in the state
+# directory; --restart replaces a stale shim holding the port without
+# re-prompting Duo when the master is still healthy.
+launch_shim() {  # launch_shim <extra mode flags...>
+  nohup uvx argo-shim "$@" --restart --codex --port "$ARGO_PORT" \
+    >>"$ARGO_LOG" 2>&1 &
+  echo "argo-shim-all: shim starting in background on port $ARGO_PORT (log: $ARGO_LOG)"
+}
+
 argo_away() {
   echo "argo-shim-all: away -- tunnelling Argo through CELS"
   # OpenCode's Argo provider rides an SSH tunnel to apps.inside.anl.gov.
-  # This is the step that costs a Duo prompt; the shim below reuses the
-  # healthy master via --restart instead of re-prompting.
+  # This is the step that costs a Duo prompt.
   uvx argo-shim --opencode || report "argo-shim --opencode (OpenCode Argo provider may be stale)"
-  nohup uvx argo-shim --restart --codex --port "$ARGO_PORT" \
-    >>"$ARGO_LOG" 2>&1 &
-  echo "argo-shim-all: shim starting in background on port $ARGO_PORT (log: $ARGO_LOG)"
+  launch_shim
 }
 
 case "$where" in
 lab)
   echo "argo-shim-all: at the lab -- Argo in direct mode (no tunnels, no Duo prompt)"
-  nohup uvx argo-shim --direct --restart --codex --port "$ARGO_PORT" \
-    >>"$ARGO_LOG" 2>&1 &
-  echo "argo-shim-all: shim starting in background on port $ARGO_PORT (log: $ARGO_LOG)"
+  launch_shim --direct
   ;;
 away)
   argo_away

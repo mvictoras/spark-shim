@@ -10,7 +10,9 @@ import contextlib
 import io
 import os
 import shutil
+import socket
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -436,6 +438,54 @@ class CLITestCase(unittest.TestCase):
         self.assertIn("start_relay", names)
         self.assertNotIn("start_loopback_relay", names)
         self.assertNotIn("start_tunnel", names)
+
+
+class HermesHealthTestCase(unittest.TestCase):
+    """The real health check: an HTTP response through the forward counts,
+    a refusal or a silent close does not (the laptop-sleep leftover)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="spark-shim-health-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.mod = load_module(self.tmp)
+
+    def serve(self, behaviour):
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+
+        def run():
+            srv.settimeout(3)
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            if behaviour == "respond":
+                conn.recv(256)
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            elif behaviour == "silent":
+                pass  # accept and close without a byte
+            conn.close()
+            srv.close()
+
+        threading.Thread(target=run, daemon=True).start()
+        return port
+
+    def test_any_http_response_counts_as_healthy(self):
+        self.mod.HERMES_TUNNEL_PORT = self.serve("respond")
+        self.assertTrue(self.mod.hermes_tunnel_healthy())
+
+    def test_refused_connection_is_dead(self):
+        self.mod.HERMES_TUNNEL_PORT = 1  # nothing listens on port 1
+        self.assertFalse(self.mod.hermes_tunnel_healthy())
+
+    def test_silent_close_is_dead(self):
+        # The laptop-sleep leftover: ssh's listener accepts, then the
+        # connection closes with no data because the far end is unreachable.
+        self.mod.HERMES_TUNNEL_PORT = self.serve("silent")
+        self.assertFalse(self.mod.hermes_tunnel_healthy())
 
 
 if __name__ == "__main__":
