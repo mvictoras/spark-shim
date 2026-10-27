@@ -11,15 +11,19 @@ config to point at it.
 
 ## Topology
 
-    home         ->  127.0.0.1:4100  ==ssh -J login-gce==>  titan:4000
-    ALCF login   ->  titan.alcf.anl.gov:4000  (direct, no tunnel)
-    ALCF compute ->  http://<login-node>:4100  (socat relay via --publish)
+    home (VPN)   ->  titan.alcf.anl.gov:4000  (direct, no tunnel)
+    home (off-site) ->  127.0.0.1:4100  ==ssh -J login-gce==>  titan:4000
+    ALCF login   ->  0.0.0.0:4100 ==ssh -J logins.cels==> titan:4000  (MFA once)
+    ALCF compute ->  http://<login-node>:4100  (relay via --publish)
 
 `titan` and `login-gce` are ssh_config aliases, not hostnames. Usernames and
 keys live in `~/.ssh/config`. The `titan` alias itself carries no ProxyJump —
 the off-site tunnel passes `-J login-gce` explicitly, so that hop is supplied
-by this script, not the config. Only the off-site mode uses SSH at all: the
-ALCF paths are direct TCP (relay) or nothing.
+by this script, not the config. The publish relay also uses SSH (the chain
+above), because ALCF login nodes cannot route to the gateway port at all.
+
+`login-gce` on the Mac and `logins.cels.anl.gov` in publish mode are the same
+host — the alias is just your Mac's ssh_config name for it.
 
 ## Usage
 
@@ -51,27 +55,52 @@ port defaults to 4000 when omitted.
 
 ## ALCF compute-node recipe
 
-ALCF compute nodes cannot reach titan (or the internet) directly. On a
-login node run:
+ALCF compute nodes cannot reach titan at all — and neither can ALCF login
+nodes: the gateway port is filtered from the compute-center zone (and, as it
+turns out, from CELS hosts too — only titan's own loopback is guaranteed to
+answer). On a login node run:
 
     spark-shim --publish
 
-That starts `socat TCP-LISTEN:4100,fork,reuseaddr,bind=0.0.0.0` forwarding
-to `titan.alcf.anl.gov:4000`, verifies the gateway actually answers through
-it, and rewrites the shared-home client configs to
-`http://<login-node>:4100/v1`. Compute nodes need nothing installed — they
-just use the shared configs.
+This picks the relay that fits, in order:
+
+- **Gateway routable from here** (e.g. a VPN'd Mac): plain
+  `socat TCP-LISTEN:4100,fork,reuseaddr,bind=0.0.0.0` to the gateway.
+- **Gateway not routable, primary route (titan loopback)**: jump through the
+  CELS login gateway and let *titan* dial the far end itself —
+  `ssh -J $CELS_USERNAME@logins.cels.anl.gov -L 0.0.0.0:4100:127.0.0.1:4000 $SPARK_TITAN_USER@titan.alcf.anl.gov`.
+  Same topology as the off-site Mac tunnel, bound on `0.0.0.0`. Only
+  titan:22 must be reachable from CELS — the gateway port never has to be,
+  which is why this route survives firewall changes that break the homes
+  chain (verified working from Polaris, Oct 2026). The titan-side username
+  defaults to your local username; override with `$SPARK_TITAN_USER`.
+- **Fallback (homes.cels chain)**: dial the gateway from CELS space —
+  `ssh -J $CELS_USERNAME@logins.cels.anl.gov -L 0.0.0.0:4100:<gateway> $CELS_USERNAME@homes.cels.anl.gov`.
+  Tried only if the titan-loopback relay fails to answer.
+
+Both ssh routes require MFA on first connect: with a terminal the prompt
+appears inline. A `ControlPersist` master keeps the authentication alive, so
+the token is typed once and later runs (including non-interactive ones)
+multiplex without re-auth. A consecutive-failure counter (3) stops retrying
+so a looping script cannot get the login node's IP blocked by CSPO;
+bootstrap interactively once, then delete
+`~/.cache/spark-shim/ssh-fail-count` to reset it.
+
+Set `CELS_USERNAME` if your CELS username differs from your local one (and
+`SPARK_TITAN_USER` for the titan side, if that differs too).
+
+Either way the script verifies the gateway answers through the relay and
+rewrites the shared-home client configs to `http://<login-node>:4100/v1`.
+Compute nodes need nothing installed — they just use the shared configs. If
+the compute-center firewall filters the relay port too, fall back to a
+per-node SSH tunnel (see Security notes). Use the **short hostname**
+(`polaris-login-02`, not the FQDN) from compute nodes — split DNS on ALCF
+resolves the FQDN to an unrouteable address from there.
 
 The relay is detached from the launching shell (survives logout), is reused
 if a healthy one is already on the port, and is stopped with
 `spark-shim --stop`. If the port is held by something else, pick another
 with `--port`.
-
-Why socat and not an SSH tunnel: on the login node the gateway is reachable
-directly, so a plain TCP relay is the minimal moving part — no keys, no
-agent, and no CSPO lockout risk from failed SSH auths on a shared machine.
-SSH's authentication protects tunnel creation, not tunnel use; a 0.0.0.0
-listener has the same exposure either way.
 
 ## API key
 
@@ -91,6 +120,15 @@ Resolution order: `$SPARK_API_KEY`, then
   `--restore-claude`. Claude Code has exactly one base URL, so argo and
   spark cannot both own it.
 
+## Environment variables
+
+- `SPARK_GATEWAY` — gateway endpoint override (see above).
+- `SPARK_SHIM_PORT` — default relay/tunnel port (see above).
+- `SPARK_API_KEY` — gateway key (see API key section).
+- `CELS_USERNAME` — CELS ssh username (publish mode; defaults to local user).
+- `SPARK_TITAN_USER` — titan ssh username for the publish relay (defaults to
+  local user).
+
 ## Security notes
 
 - The `--publish` relay is an unauthenticated TCP endpoint on 0.0.0.0 of a
@@ -105,8 +143,8 @@ Resolution order: `$SPARK_API_KEY`, then
 ## Requirements
 
 - python 3 (stdlib only)
-- `socat` for `--publish` (ALCF login node)
-- `ssh` and `lsof` for the off-site tunnel mode
+- `socat` for `--publish` when the gateway is directly routable
+- `ssh` and `lsof` for the off-site tunnel mode and the publish ssh relays
 
 ## Layout
 

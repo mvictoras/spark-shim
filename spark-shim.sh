@@ -16,19 +16,28 @@ speak HTTP, not SSH.
 This script bridges that gap: it puts a plain local TCP port in front of the
 gateway and rewrites each client's config to point at it.
 
-    home         ->  127.0.0.1:4100  ==ssh -J login-gce==>  titan:4000
-    ALCF login   ->  titan.alcf.anl.gov:4000  (direct, no tunnel)
-    ALCF compute ->  http://<login-node>:4100  (socat relay via --publish)
+    home (VPN)   ->  titan.alcf.anl.gov:4000  (direct, no tunnel)
+    home (off-site) ->  127.0.0.1:4100  ==ssh -J login-gce==>  titan:4000
+    ALCF login   ->  0.0.0.0:4100 ==ssh -J logins.cels==> titan:4000  (MFA once)
+    ALCF compute ->  http://<login-node>:4100  (relay via --publish)
 
-Location is auto-detected, so the same command works in both places. ALCF
-compute nodes cannot reach titan (or the internet) directly, so --publish
-runs on a login node: it exposes a socat relay on 0.0.0.0 and rewrites the
-shared-home client configs to <login-node>:<port>. Compute nodes need
-nothing installed -- they just use the shared configs.
+ALCF compute nodes cannot reach titan at all -- and neither can ALCF login
+nodes (every port to the DGX is filtered from the compute-center zone), so
+--publish picks the relay that fits: plain socat where the gateway is
+routable, otherwise SSH through the CELS network. The primary ssh relay
+jumps to titan and lets *titan* dial the far end from its own loopback --
+same topology as the off-site Mac tunnel, bound on 0.0.0.0 -- so only
+titan:22 must be reachable from CELS, never the gateway port (which is
+filtered from every CELS host). A homes.cels chain that dials the gateway
+from CELS space is kept as fallback. Both need MFA once; ControlPersist
+keeps the authenticated master alive so the token is typed once. The relay
+binds 0.0.0.0 and rewrites the shared-home client configs to
+<login-node>:<port>. Compute nodes need nothing installed -- they just use
+the shared configs.
 
 Usage:
     spark-shim                  # connect + configure opencode & codex
-    spark-shim --publish        # ALCF login node: socat relay for compute nodes
+    spark-shim --publish        # login node: relay the gateway for compute nodes
     spark-shim --gateway h:p    # target a different gateway endpoint
     spark-shim --claude         # ...and repoint Claude Code (displaces argo)
     spark-shim --status         # what's running, what's configured
@@ -39,6 +48,7 @@ Usage:
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -55,16 +65,30 @@ import urllib.request
 # `titan` and `login-gce` are ssh_config aliases, NOT hostnames. Their
 # usernames and keys live in ~/.ssh/config. The `titan` alias itself has no
 # ProxyJump: the off-site tunnel passes `-J login-gce` explicitly, so this
-# script -- not the config -- supplies that hop. Only the off-site tunnel
-# uses SSH at all; the ALCF paths are direct TCP (socat) or nothing.
+# script -- not the config -- supplies that hop. The off-site tunnel and the
+# publish-mode ssh relays are the only SSH paths; direct routability uses
+# plain TCP (socat).
 SSH_HOST = "titan"
 SSH_JUMP = "login-gce"
-REMOTE_BIND = "127.0.0.1"   # gateway listens on 0.0.0.0, but loopback-from-titan
-                            # is the shortest path once we're on the box
+REMOTE_BIND = "127.0.0.1"  # gateway listens on 0.0.0.0, but loopback-from-titan
+# is the shortest path once we're on the box
 DEFAULT_GATEWAY_HOST = "titan.alcf.anl.gov"
 DEFAULT_GATEWAY_PORT = 4000
-GATEWAY_HOST = DEFAULT_GATEWAY_HOST   # override with --gateway or $SPARK_GATEWAY
+GATEWAY_HOST = DEFAULT_GATEWAY_HOST  # override with --gateway or $SPARK_GATEWAY
 GATEWAY_PORT = DEFAULT_GATEWAY_PORT
+
+# CELS jump for hosts that cannot route to titan (ALCF compute-center
+# nodes): the same jump argo-shim uses for apps.inside.anl.gov, and the same
+# one the off-site Mac tunnel uses (login-gce is an alias for logins.cels).
+# logins.cels sshd may demand MFA -- ControlPersist keeps the master
+# authenticated so the token is typed once. Note logins.cels can reach
+# titan:22 but NOT the gateway port (titan:4000 is filtered from all CELS
+# hosts), which is why the primary relay dials the far end from titan
+# itself and the homes chain is only a fallback.
+SSH_CELS_JUMP = "logins.cels.anl.gov"
+SSH_CELS_TARGET = "homes.cels.anl.gov"
+
+MAX_SSH_FAILURES = 3  # CSPO blocks the login node's IP after repeated auth failures
 
 DEFAULT_PORT = 4100
 FALLBACK_KEY = "sk-spark-anl-c72183474362a422"
@@ -95,6 +119,7 @@ def die(msg, code=1):
 
 
 # --- reachability -----------------------------------------------------------
+
 
 def port_open(host, port, timeout=3.0):
     """True if a TCP connection to host:port completes."""
@@ -137,7 +162,7 @@ def apply_gateway(spec):
     spec = spec.strip()
     for scheme in ("http://", "https://"):
         if spec.startswith(scheme):
-            spec = spec[len(scheme):]
+            spec = spec[len(scheme) :]
             break
     spec = spec.rstrip("/")
     host, _, port = spec.partition(":")
@@ -148,6 +173,7 @@ def apply_gateway(spec):
 
 
 # --- tunnel lifecycle -------------------------------------------------------
+
 
 def tunnel_dest():
     """Where the ssh-side end of the -L forward points.
@@ -175,7 +201,9 @@ def tunnel_pids(port):
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         ).stdout
     except Exception:
         return pids
@@ -183,7 +211,9 @@ def tunnel_pids(port):
         try:
             args = subprocess.run(
                 ["ps", "-o", "args=", "-p", pid],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             ).stdout
         except Exception:
             continue
@@ -197,12 +227,16 @@ def port_holder(port):
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         ).stdout
         for pid in filter(None, (p.strip() for p in out.splitlines())):
             return subprocess.run(
                 ["ps", "-o", "pid=,user=,comm=", "-p", pid],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             ).stdout.strip()
     except Exception:
         pass
@@ -240,6 +274,7 @@ def _signal_pid(pid, sig):
 
 # --- socat relay (ALCF publish mode) ----------------------------------------
 
+
 def socat_pids(port):
     """PIDs of our socat relays listening for `port`.
 
@@ -250,7 +285,9 @@ def socat_pids(port):
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         ).stdout
     except Exception:
         return pids
@@ -258,7 +295,9 @@ def socat_pids(port):
         try:
             args = subprocess.run(
                 ["ps", "-o", "args=", "-p", pid],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             ).stdout
         except Exception:
             continue
@@ -308,24 +347,33 @@ def start_relay(port, dest_host, dest_port):
     no CSPO lockout risk from failed SSH auths on a shared machine.
     """
     if not shutil.which("socat"):
-        die("socat not found in PATH; publish mode needs it to expose the "
-            "gateway on 0.0.0.0.")
+        die(
+            "socat not found in PATH; publish mode needs it to expose the "
+            "gateway on 0.0.0.0."
+        )
     if socat_pids(port):
         say(f"  {OK} Reusing existing relay on 0.0.0.0:{port}")
         return
     if port_open("127.0.0.1", port, timeout=1.0):
         holder = port_holder(port) or "unknown process"
-        die(f"Port {port} is held by something else:\n    {holder}\n"
-            f"  Use --port <PORT> to pick another.")
+        die(
+            f"Port {port} is held by something else:\n    {holder}\n"
+            f"  Use --port <PORT> to pick another."
+        )
 
-    cmd = ["socat", f"TCP-LISTEN:{port},fork,reuseaddr,bind=0.0.0.0",
-           f"TCP:{dest_host}:{dest_port}"]
+    cmd = [
+        "socat",
+        f"TCP-LISTEN:{port},fork,reuseaddr,bind=0.0.0.0",
+        f"TCP:{dest_host}:{dest_port}",
+    ]
     say(f"  Publishing 0.0.0.0:{port} {DOT} {dest_host}:{dest_port} (socat)")
     # start_new_session detaches the relay from this shell so it survives
     # logout, the way `nohup ... &` would; stdio to devnull so no pipe can
     # hold a reader open.
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
     for _ in range(20):
@@ -340,6 +388,353 @@ def start_relay(port, dest_host, dest_port):
     say(f"  {OK} Relay published on 0.0.0.0:{port}")
 
 
+def cels_username():
+    return os.environ.get("CELS_USERNAME") or getpass.getuser()
+
+
+def ssh_relay_pids(port):
+    """PIDs of our ssh-chain relay processes for `port`."""
+    pids = []
+    try:
+        out = subprocess.run(
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except Exception:
+        return pids
+    spec = f"0.0.0.0:{port}:{GATEWAY_HOST}:{GATEWAY_PORT}"
+    for pid in filter(None, (p.strip() for p in out.splitlines())):
+        try:
+            args = subprocess.run(
+                ["ps", "-o", "args=", "-p", pid],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout
+        except Exception:
+            continue
+        if "ssh" in args and spec in args and SSH_CELS_TARGET in args:
+            pids.append(int(pid))
+    return pids
+
+
+def stop_ssh_relay(port, quiet=False):
+    """Stop our ssh-chain relay on `port`; True once nothing is listening."""
+    pids = ssh_relay_pids(port)
+    if not pids:
+        if not quiet:
+            say(f"  No spark-shim ssh relay on port {port}")
+        return not port_open("127.0.0.1", port, timeout=1.0)
+    return _terminate_listeners(pids, port, quiet, "ssh relay")
+
+
+def titan_ssh_relay_pids(port):
+    """PIDs of our titan-loopback ssh relays listening for `port`.
+
+    Matched by the forward spec (far end = tunnel_dest, i.e. titan's
+    loopback by default) plus the CELS jump and the absence of the homes
+    target, so it never collides with a homes-chain relay.
+    """
+    pids = []
+    try:
+        out = subprocess.run(
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except Exception:
+        return pids
+    dest_host, dest_port = tunnel_dest()
+    spec = f"0.0.0.0:{port}:{dest_host}:{dest_port}"
+    for pid in filter(None, (p.strip() for p in out.splitlines())):
+        try:
+            args = subprocess.run(
+                ["ps", "-o", "args=", "-p", pid],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout
+        except Exception:
+            continue
+        if (
+            "ssh" in args
+            and spec in args
+            and SSH_CELS_JUMP in args
+            and SSH_CELS_TARGET not in args
+        ):
+            pids.append(int(pid))
+    return pids
+
+
+def stop_titan_ssh_relay(port, quiet=False):
+    """Stop our titan-loopback ssh relay on `port`; True once nothing listens."""
+    pids = titan_ssh_relay_pids(port)
+    if not pids:
+        if not quiet:
+            say(f"  No spark-shim ssh relay on port {port}")
+        return not port_open("127.0.0.1", port, timeout=1.0)
+    return _terminate_listeners(pids, port, quiet, "ssh relay")
+
+
+def _ssh_relay_options(batch):
+    """Shared option block for publish-mode ssh relays (both routes)."""
+    opts = [
+        "-N",
+        "-f",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        "ConnectTimeout=20",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=4",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPath=~/.ssh/spark-shim-%C",
+        "-o",
+        "ControlPersist=yes",
+    ]
+    if batch:
+        opts += ["-o", "BatchMode=yes"]
+    return opts
+
+
+def ssh_relay_cmd(port, batch):
+    """homes.cels-chain relay: dial the gateway from homes (fallback route)."""
+    user = cels_username()
+    return (
+        ["ssh"]
+        + _ssh_relay_options(batch)
+        + [
+            "-J",
+            f"{user}@{SSH_CELS_JUMP}",
+            "-L",
+            f"0.0.0.0:{port}:{GATEWAY_HOST}:{GATEWAY_PORT}",
+            f"{user}@{SSH_CELS_TARGET}",
+        ]
+    )
+
+
+def titan_username():
+    """ssh login for the titan end of the publish relay.
+
+    Not the CELS account: titan takes the ALCF username. Override with
+    $SPARK_TITAN_USER if it ever differs from the local username.
+    """
+    return os.environ.get("SPARK_TITAN_USER") or getpass.getuser()
+
+
+def titan_ssh_relay_cmd(port, batch):
+    """titan-loopback relay (primary route): jump to titan via logins.cels and
+    dial the far end from titan's own loopback.
+
+    Only titan:22 must be reachable from the jump -- the gateway port never
+    has to be routable from CELS at all. Same topology as the off-site Mac
+    tunnel, bound on 0.0.0.0 instead of loopback.
+    """
+    return (
+        ["ssh"]
+        + _ssh_relay_options(batch)
+        + [
+            "-J",
+            f"{cels_username()}@{SSH_CELS_JUMP}",
+            "-L",
+            f"0.0.0.0:{port}:{tunnel_dest()[0]}:{tunnel_dest()[1]}",
+            f"{titan_username()}@{GATEWAY_HOST}",
+        ]
+    )
+
+
+def ssh_fail_count():
+    try:
+        with open(os.path.join(STATE_DIR, "ssh-fail-count")) as fh:
+            return int(fh.read().strip())
+    except Exception:
+        return 0
+
+
+def record_ssh_result(ok):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    count = 0 if ok else ssh_fail_count() + 1
+    try:
+        with open(os.path.join(STATE_DIR, "ssh-fail-count"), "w") as fh:
+            fh.write(str(count))
+    except Exception:
+        pass
+
+
+def start_ssh_relay(port):
+    """Ensure a homes-chain ssh relay 0.0.0.0:{port} -> gateway via the CELS pair.
+
+    Fallback publish route (used if the titan-loopback relay doesn't answer):
+    the forward's far end is dialed from homes.cels, which needs homes.cels
+    to reach the gateway port -- a route that has proven fragile. homes.cels
+    requires MFA, so with a TTY the command runs without BatchMode and the
+    prompt appears inline; ControlPersist keeps the master authenticated for
+    all future runs, including non-interactive ones.
+    """
+    if ssh_relay_pids(port):
+        say(f"  {OK} Reusing existing ssh relay on 0.0.0.0:{port}")
+        return
+    if port_open("127.0.0.1", port, timeout=1.0):
+        holder = port_holder(port) or "unknown process"
+        die(
+            f"Port {port} is held by something else:\n    {holder}\n"
+            f"  Use --port <PORT> to pick another."
+        )
+
+    fails = ssh_fail_count()
+    if fails >= MAX_SSH_FAILURES:
+        die(
+            f"SSH to CELS has failed {fails} consecutive times; not retrying "
+            f"to avoid getting this login node's IP blocked.\n"
+            f"  Bootstrap once interactively (answer the MFA prompt), then "
+            f"delete: {STATE_DIR}/ssh-fail-count"
+        )
+
+    interactive = sys.stdin.isatty()
+    cmd = ssh_relay_cmd(port, batch=not interactive)
+    # ssh -f forks a daemon that inherits stdout/stderr, so a captured pipe
+    # would stay open for the relay's lifetime and hang the caller -- stderr
+    # goes to a real file instead (same trap start_tunnel documents).
+    if interactive:
+        say("  Opening ssh relay via CELS (answer the MFA prompt if shown)")
+        with tempfile.TemporaryFile(mode="w+") as errfile:
+            code = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=errfile
+            ).returncode
+            if code != 0:
+                errfile.seek(0)
+                detail = errfile.read().strip()
+                say(f"  ssh said: {detail}")
+    else:
+        say("  Opening ssh relay via CELS (non-interactive, BatchMode)")
+        with tempfile.TemporaryFile(mode="w+") as errfile:
+            code = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=errfile
+            ).returncode
+            errfile.seek(0)
+            detail = errfile.read().strip()
+        if code != 0:
+            say(
+                "  BatchMode could not authenticate: no MFA master is "
+                "available in a non-interactive shell"
+                + (f" -- ssh said: {detail}" if detail else "")
+            )
+    if code != 0:
+        record_ssh_result(False)
+        die(
+            "ssh relay failed.\n"
+            "  Run this once from an interactive shell on this node and "
+            "answer the MFA prompt:\n"
+            f"    {' '.join(ssh_relay_cmd(port, batch=False))}\n"
+            "  The ControlPersist master then stays authenticated, and "
+            "--publish works non-interactively afterwards."
+        )
+
+    for _ in range(20):
+        if port_open("127.0.0.1", port, timeout=1.0):
+            break
+        time.sleep(0.5)
+    else:
+        record_ssh_result(False)
+        stop_ssh_relay(port, quiet=True)
+        die(f"ssh relay on port {port} never started listening")
+    record_ssh_result(True)
+    say(f"  {OK} ssh relay published on 0.0.0.0:{port} (via {SSH_CELS_TARGET})")
+
+
+def start_titan_ssh_relay(port):
+    """Ensure a titan-loopback ssh relay 0.0.0.0:{port} -> gateway.
+
+    Primary publish route on ALCF compute-center nodes: jump through the
+    CELS login gateway to titan and dial the forward's far end from titan's
+    own loopback (same topology as the off-site Mac tunnel, bound on
+    0.0.0.0). Only titan:22 must be reachable from CELS -- the gateway port
+    itself is filtered from every CELS host, which is what makes the
+    homes.cels chain unreliable. Returns True once the port listens; False
+    on any failure so the caller can fall back to the homes chain.
+    """
+    if titan_ssh_relay_pids(port):
+        say(f"  {OK} Reusing existing ssh relay on 0.0.0.0:{port}")
+        return True
+    if port_open("127.0.0.1", port, timeout=1.0):
+        holder = port_holder(port) or "unknown process"
+        die(
+            f"Port {port} is held by something else:\n    {holder}\n"
+            f"  Use --port <PORT> to pick another."
+        )
+
+    fails = ssh_fail_count()
+    if fails >= MAX_SSH_FAILURES:
+        say(
+            f"  {WARN} SSH to CELS has failed {fails} consecutive times; "
+            f"not retrying to avoid getting this login node's IP blocked.\n"
+            f"  Bootstrap once interactively (answer the MFA prompt), then "
+            f"delete: {STATE_DIR}/ssh-fail-count"
+        )
+        return False
+
+    interactive = sys.stdin.isatty()
+    cmd = titan_ssh_relay_cmd(port, batch=not interactive)
+    # ssh -f forks a daemon that inherits stdout/stderr, so a captured pipe
+    # would stay open for the relay's lifetime and hang the caller -- stderr
+    # goes to a real file instead (same trap start_tunnel documents).
+    if interactive:
+        say("  Opening ssh relay to titan via CELS (answer the MFA prompt if shown)")
+        with tempfile.TemporaryFile(mode="w+") as errfile:
+            code = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=errfile
+            ).returncode
+            if code != 0:
+                errfile.seek(0)
+                detail = errfile.read().strip()
+                say(f"  ssh said: {detail}")
+    else:
+        say("  Opening ssh relay to titan via CELS (non-interactive, BatchMode)")
+        with tempfile.TemporaryFile(mode="w+") as errfile:
+            code = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=errfile
+            ).returncode
+            errfile.seek(0)
+            detail = errfile.read().strip()
+        if code != 0:
+            say(
+                "  BatchMode could not authenticate: no MFA master is "
+                "available in a non-interactive shell"
+                + (f" -- ssh said: {detail}" if detail else "")
+            )
+    if code != 0:
+        record_ssh_result(False)
+        say(
+            f"  {BAD} ssh relay to titan failed. To bootstrap by hand, run "
+            f"this once from an interactive shell on this node and answer "
+            f"the MFA prompt:\n"
+            f"    {' '.join(titan_ssh_relay_cmd(port, batch=False))}"
+        )
+        return False
+
+    for _ in range(20):
+        if port_open("127.0.0.1", port, timeout=1.0):
+            break
+        time.sleep(0.5)
+    else:
+        record_ssh_result(False)
+        stop_titan_ssh_relay(port, quiet=True)
+        say(f"  {BAD} ssh relay on port {port} never started listening")
+        return False
+    record_ssh_result(True)
+    say(f"  {OK} ssh relay published on 0.0.0.0:{port} (far end dialed by titan)")
+    return True
+
+
 def start_tunnel(port, api_key):
     """Ensure a working tunnel on `port`; reuse a healthy one if present."""
     if tunnel_pids(port):
@@ -349,34 +744,51 @@ def start_tunnel(port, api_key):
         # Ours, but no longer carrying traffic (laptop slept, gateway bounced).
         say(f"  {WARN} Existing tunnel on {port} is stale, replacing it")
         if not stop_tunnel(port, quiet=True):
-            die(f"Could not free port {port} from the stale tunnel.\n"
+            die(
+                f"Could not free port {port} from the stale tunnel.\n"
                 f"  Inspect it with: lsof -iTCP:{port} -sTCP:LISTEN\n"
-                f"  Or use --port <PORT> to pick another.")
+                f"  Or use --port <PORT> to pick another."
+            )
 
     if port_open("127.0.0.1", port, timeout=1.0):
         holder = port_holder(port) or "unknown process"
-        die(f"Port {port} is held by something else:\n    {holder}\n"
-            f"  Use --port <PORT> to pick another.")
+        die(
+            f"Port {port} is held by something else:\n    {holder}\n"
+            f"  Use --port <PORT> to pick another."
+        )
 
     # ControlMaster is disabled on purpose. Sharing the multiplexed connection
     # from ~/.ssh/config means the tunnel dies whenever that master exits (e.g.
     # you close an unrelated titan shell). This mirrors the dedicated
     # *-tunnel hosts already in ~/.ssh/config.
     cmd = [
-        "ssh", "-N", "-f",
-        "-o", "BatchMode=yes",
-        "-o", "ExitOnForwardFailure=yes",
-        "-o", "ConnectTimeout=30",
-        "-o", "ServerAliveInterval=30",
-        "-o", "ServerAliveCountMax=3",
-        "-o", "ControlMaster=no",
-        "-o", "ControlPath=none",
-        "-J", SSH_JUMP,
-        "-L", f"127.0.0.1:{forward_spec(port)}",
+        "ssh",
+        "-N",
+        "-f",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ConnectTimeout=30",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-J",
+        SSH_JUMP,
+        "-L",
+        f"127.0.0.1:{forward_spec(port)}",
         SSH_HOST,
     ]
     dest_host, dest_port = tunnel_dest()
-    say(f"  Opening tunnel 127.0.0.1:{port} {DOT} {dest_host}:{dest_port} via {SSH_JUMP}")
+    say(
+        f"  Opening tunnel 127.0.0.1:{port} {DOT} {dest_host}:{dest_port} via {SSH_JUMP}"
+    )
     # `ssh -f` forks a daemon that inherits whatever stdout/stderr it is given.
     # Any pipe therefore stays open for the life of the tunnel, so a caller
     # reading that pipe (a script, a subshell, $(...)) hangs forever -- and
@@ -389,10 +801,12 @@ def start_tunnel(port, api_key):
         errfile.seek(0)
         detail = errfile.read().strip()
     if returncode != 0:
-        die("SSH tunnel failed."
-            + (f"\n  ssh said: {detail}" if detail else "") +
-            "\n  Check your agent has the right key loaded:  ssh-add -l\n"
-            f"  Then try the hop by hand:  ssh -J {SSH_JUMP} {SSH_HOST}")
+        die(
+            "SSH tunnel failed."
+            + (f"\n  ssh said: {detail}" if detail else "")
+            + "\n  Check your agent has the right key loaded:  ssh-add -l\n"
+            f"  Then try the hop by hand:  ssh -J {SSH_JUMP} {SSH_HOST}"
+        )
 
     for _ in range(20):
         if port_open("127.0.0.1", port, timeout=1.0):
@@ -403,13 +817,16 @@ def start_tunnel(port, api_key):
 
     if not gateway_responds("127.0.0.1", port, api_key):
         stop_tunnel(port, quiet=True)
-        die(f"Tunnel opened but the gateway did not answer.\n"
+        die(
+            f"Tunnel opened but the gateway did not answer.\n"
             f"  Is LiteLLM still up?  ssh -J {SSH_JUMP} {SSH_HOST} "
-            f"'curl -s localhost:{GATEWAY_PORT}/v1/models'")
+            f"'curl -s localhost:{GATEWAY_PORT}/v1/models'"
+        )
     say(f"  {OK} Tunnel up and gateway responding")
 
 
 # --- credentials ------------------------------------------------------------
+
 
 def resolve_api_key():
     """Find the gateway key: env wins, then opencode.json, then the known key."""
@@ -428,6 +845,7 @@ def resolve_api_key():
 
 
 # --- client configuration ---------------------------------------------------
+
 
 def update_opencode(base_url, api_key):
     try:
@@ -470,7 +888,9 @@ def update_codex(base_url):
 
     text = re.sub(
         re.escape(CODEX_BEGIN) + r".*?" + re.escape(CODEX_END) + r"\n?",
-        "", text, flags=re.DOTALL,
+        "",
+        text,
+        flags=re.DOTALL,
     ).rstrip("\n")
 
     block = f"""{CODEX_BEGIN}
@@ -479,7 +899,7 @@ def update_codex(base_url):
 name = "Spark (DGX titan)"
 base_url = "{base_url}/v1"
 env_key = "SPARK_API_KEY"
-wire_api = "chat"
+wire_api = "responses"
 
 [profiles.spark]
 model_provider = "spark"
@@ -537,8 +957,10 @@ def update_claude(base_url, api_key):
         json.dump(settings, fh, indent=2)
         fh.write("\n")
     say(f"  {OK} claude     ANTHROPIC_BASE_URL {DOT} {base_url}")
-    say(f"  {WARN} Claude Code now talks to Spark, not Argo. "
-        f"Undo with: spark-shim --restore-claude")
+    say(
+        f"  {WARN} Claude Code now talks to Spark, not Argo. "
+        f"Undo with: spark-shim --restore-claude"
+    )
     return True
 
 
@@ -557,6 +979,7 @@ def restore_claude():
 
 # --- reporting --------------------------------------------------------------
 
+
 def fetch_models(base_url, api_key):
     req = urllib.request.Request(
         f"{base_url}/v1/models", headers={"Authorization": f"Bearer {api_key}"}
@@ -569,7 +992,8 @@ def roundtrip(base_url, api_key, path, payload, headers):
     """POST `payload` and return (ok, detail) for a real inference call."""
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
-        f"{base_url}{path}", data=body,
+        f"{base_url}{path}",
+        data=body,
         headers={"content-type": "application/json", **headers},
     )
     started = time.time()
@@ -586,22 +1010,33 @@ def roundtrip(base_url, api_key, path, payload, headers):
 def run_tests(base_url, api_key):
     say("\nRound-trip tests (real inference, may take a moment):")
     ok_openai, detail = roundtrip(
-        base_url, api_key, "/v1/chat/completions",
-        {"model": BIG_MODEL, "max_tokens": 16,
-         "messages": [{"role": "user", "content": "say hi"}]},
+        base_url,
+        api_key,
+        "/v1/chat/completions",
+        {
+            "model": BIG_MODEL,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "say hi"}],
+        },
         {"Authorization": f"Bearer {api_key}"},
     )
-    say(f"  [1/2] OpenAI    /v1/chat/completions  "
-        f"{OK if ok_openai else BAD} {detail}")
+    say(f"  [1/2] OpenAI    /v1/chat/completions  {OK if ok_openai else BAD} {detail}")
 
     ok_anthropic, detail = roundtrip(
-        base_url, api_key, "/v1/messages",
-        {"model": BIG_MODEL, "max_tokens": 16,
-         "messages": [{"role": "user", "content": "say hi"}]},
+        base_url,
+        api_key,
+        "/v1/messages",
+        {
+            "model": BIG_MODEL,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "say hi"}],
+        },
         {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
     )
-    say(f"  [2/2] Anthropic /v1/messages          "
-        f"{OK if ok_anthropic else BAD} {detail}")
+    say(
+        f"  [2/2] Anthropic /v1/messages          "
+        f"{OK if ok_anthropic else BAD} {detail}"
+    )
     return ok_openai and ok_anthropic
 
 
@@ -611,23 +1046,49 @@ def show_status(port, api_key, key_source):
 
     pids = tunnel_pids(port)
     if pids:
-        say(f"  Tunnel             {OK} running on 127.0.0.1:{port} "
-            f"(PID {', '.join(map(str, pids))})")
+        say(
+            f"  Tunnel             {OK} running on 127.0.0.1:{port} "
+            f"(PID {', '.join(map(str, pids))})"
+        )
     else:
         say(f"  Tunnel             {DOT} not running on port {port}")
 
     relay = socat_pids(port)
     if relay:
-        say(f"  Relay 0.0.0.0      {OK} running on 0.0.0.0:{port} "
-            f"(PID {', '.join(map(str, relay))})")
+        say(
+            f"  Relay 0.0.0.0      {OK} running on 0.0.0.0:{port} "
+            f"(PID {', '.join(map(str, relay))})"
+        )
     else:
         say(f"  Relay 0.0.0.0      {DOT} not running on port {port}")
 
-    direct = port_open(GATEWAY_HOST, GATEWAY_PORT, timeout=3.0)
-    say(f"  ALCF network       {OK + ' yes (direct path available)' if direct else DOT + ' no (off-site, tunnel required)'}")
+    ssh_relay = ssh_relay_pids(port)
+    if ssh_relay:
+        say(
+            f"  Relay (homes ssh)  {OK} running on 0.0.0.0:{port} "
+            f"(PID {', '.join(map(str, ssh_relay))})"
+        )
+    else:
+        say(f"  Relay (homes ssh)  {DOT} not running on port {port}")
 
-    for label, url in (("via tunnel", f"http://127.0.0.1:{port}"),
-                       ("direct", f"http://{GATEWAY_HOST}:{GATEWAY_PORT}")):
+    titan_relay = titan_ssh_relay_pids(port)
+    if titan_relay:
+        say(
+            f"  Relay (titan ssh)  {OK} running on 0.0.0.0:{port} "
+            f"(PID {', '.join(map(str, titan_relay))})"
+        )
+    else:
+        say(f"  Relay (titan ssh)  {DOT} not running on port {port}")
+
+    direct = port_open(GATEWAY_HOST, GATEWAY_PORT, timeout=3.0)
+    say(
+        f"  ALCF network       {OK + ' yes (direct path available)' if direct else DOT + ' no (off-site, tunnel required)'}"
+    )
+
+    for label, url in (
+        ("via tunnel", f"http://127.0.0.1:{port}"),
+        ("direct", f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"),
+    ):
         host = GATEWAY_HOST if label == "direct" else "127.0.0.1"
         prt = GATEWAY_PORT if label == "direct" else port
         live = gateway_responds(host, prt, api_key, timeout=5)
@@ -643,15 +1104,20 @@ def show_status(port, api_key, key_source):
     try:
         with open(CODEX_CONFIG) as fh:
             text = fh.read()
-        match = re.search(r'base_url = "([^"]+)"', text[text.find(CODEX_BEGIN):]) \
-            if CODEX_BEGIN in text else None
+        match = (
+            re.search(r'base_url = "([^"]+)"', text[text.find(CODEX_BEGIN) :])
+            if CODEX_BEGIN in text
+            else None
+        )
         say(f"    codex      {match.group(1) if match else DOT + ' not configured'}")
     except Exception:
         say(f"    codex      {DOT} not configured")
     try:
         with open(CLAUDE_SETTINGS) as fh:
             env = json.load(fh).get("env", {})
-        managed = " (spark-shim)" if env.get("_SPARK_SHIM_MANAGED") == "1" else " (not spark)"
+        managed = (
+            " (spark-shim)" if env.get("_SPARK_SHIM_MANAGED") == "1" else " (not spark)"
+        )
         say(f"    claude     {env.get('ANTHROPIC_BASE_URL', '?')}{managed}")
     except Exception:
         say(f"    claude     {DOT} not configured")
@@ -659,38 +1125,74 @@ def show_status(port, api_key, key_source):
 
 # --- entry point ------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
         prog="spark-shim",
         description="Reach the DGX LiteLLM gateway on titan from anywhere.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Default action: connect (auto-detecting direct vs tunnel) and "
-               "configure opencode + codex.",
+        "configure opencode + codex.",
     )
-    parser.add_argument("--port", type=int, default=int(os.environ.get("SPARK_SHIM_PORT", DEFAULT_PORT)),
-                        help=f"local port for the tunnel (default: {DEFAULT_PORT})")
-    parser.add_argument("--gateway", default=None, metavar="HOST[:PORT]",
-                        help="gateway endpoint override (default: titan.alcf.anl.gov:4000); "
-                             "scheme optional, also settable via $SPARK_GATEWAY")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("SPARK_SHIM_PORT", DEFAULT_PORT)),
+        help=f"local port for the tunnel (default: {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--gateway",
+        default=None,
+        metavar="HOST[:PORT]",
+        help="gateway endpoint override (default: titan.alcf.anl.gov:4000); "
+        "scheme optional, also settable via $SPARK_GATEWAY",
+    )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--direct", action="store_true",
-                      help="force direct connection, skip the tunnel (ALCF network only)")
-    mode.add_argument("--tunnel", action="store_true",
-                      help="force the SSH tunnel even if titan looks directly reachable")
-    mode.add_argument("--publish", action="store_true",
-                      help="ALCF login node: publish a 0.0.0.0 socat relay to the gateway "
-                           "and point clients at <hostname>:<port> for compute nodes")
-    parser.add_argument("--claude", action="store_true",
-                        help="also repoint Claude Code at Spark (displaces Argo; backed up)")
-    parser.add_argument("--no-opencode", action="store_true", help="don't touch opencode.json")
-    parser.add_argument("--no-codex", action="store_true", help="don't touch codex config.toml")
-    parser.add_argument("--restore-claude", action="store_true",
-                        help="restore the Claude Code settings displaced by --claude")
+    mode.add_argument(
+        "--direct",
+        action="store_true",
+        help="force direct connection, skip the tunnel (ALCF network only)",
+    )
+    mode.add_argument(
+        "--tunnel",
+        action="store_true",
+        help="force the SSH tunnel even if titan looks directly reachable",
+    )
+    mode.add_argument(
+        "--publish",
+        action="store_true",
+        help="ALCF login node: publish a 0.0.0.0 relay to the gateway "
+        "(socat if routable, ssh via CELS otherwise) and point clients at "
+        "<hostname>:<port> for compute nodes",
+    )
+    parser.add_argument(
+        "--claude",
+        action="store_true",
+        help="also repoint Claude Code at Spark (displaces Argo; backed up)",
+    )
+    parser.add_argument(
+        "--no-opencode", action="store_true", help="don't touch opencode.json"
+    )
+    parser.add_argument(
+        "--no-codex", action="store_true", help="don't touch codex config.toml"
+    )
+    parser.add_argument(
+        "--restore-claude",
+        action="store_true",
+        help="restore the Claude Code settings displaced by --claude",
+    )
     parser.add_argument("--status", action="store_true", help="show status and exit")
-    parser.add_argument("--stop", action="store_true", help="tear down the tunnel and relay, then exit")
-    parser.add_argument("--models", action="store_true", help="list served models and exit")
-    parser.add_argument("--test", action="store_true",
-                        help="run real round-trip tests on both wire protocols")
+    parser.add_argument(
+        "--stop", action="store_true", help="tear down the tunnel and relay, then exit"
+    )
+    parser.add_argument(
+        "--models", action="store_true", help="list served models and exit"
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="run real round-trip tests on both wire protocols",
+    )
     args = parser.parse_args()
 
     gateway_spec = args.gateway or os.environ.get("SPARK_GATEWAY")
@@ -704,9 +1206,11 @@ def main():
         restore_claude()
         return
     if args.stop:
-        say("Stopping spark-shim tunnel and relay...")
+        say("Stopping spark-shim tunnels and relays...")
         stop_tunnel(args.port)
         stop_relay(args.port)
+        stop_ssh_relay(args.port)
+        stop_titan_ssh_relay(args.port)
         return
     if args.status:
         show_status(args.port, api_key, key_source)
@@ -715,10 +1219,6 @@ def main():
     # Decide how to reach the gateway.
     if args.publish:
         say("Publish mode: relaying the gateway for ALCF compute nodes...")
-        if not detect_direct(api_key):
-            die(f"{GATEWAY_HOST}:{GATEWAY_PORT} is not reachable from here.\n"
-                "  --publish belongs on an ALCF login node; compute nodes only "
-                "consume the configs it writes.")
         use_tunnel = False
     elif args.direct:
         use_tunnel = False
@@ -727,29 +1227,49 @@ def main():
     else:
         say("Locating the gateway...")
         direct = detect_direct(api_key)
-        say(f"  {OK if direct else DOT} {GATEWAY_HOST}:{GATEWAY_PORT} "
-            f"{'reachable directly (on ALCF network)' if direct else 'unreachable (off-site)'}")
+        say(
+            f"  {OK if direct else DOT} {GATEWAY_HOST}:{GATEWAY_PORT} "
+            f"{'reachable directly (on ALCF network)' if direct else 'unreachable (off-site)'}"
+        )
         use_tunnel = not direct
         if direct:
-            say(f"  {WARN} Compute nodes cannot reach titan directly; on a "
-                f"login node, run: spark-shim --publish")
+            say(
+                f"  {WARN} Compute nodes cannot reach titan directly; on a "
+                f"login node, run: spark-shim --publish"
+            )
 
     if args.publish:
-        start_relay(args.port, GATEWAY_HOST, GATEWAY_PORT)
+        if detect_direct(api_key):
+            start_relay(args.port, GATEWAY_HOST, GATEWAY_PORT)
+        else:
+            say(
+                f"  {DOT} {GATEWAY_HOST}:{GATEWAY_PORT} is not routable from here; "
+                "relaying over SSH (titan loopback first, homes.cels chain as fallback)"
+            )
+            if not start_titan_ssh_relay(args.port):
+                stop_titan_ssh_relay(args.port, quiet=True)
+                say(f"  {DOT} Falling back to the homes.cels chain")
+                start_ssh_relay(args.port)
         if not gateway_responds("127.0.0.1", args.port, api_key):
             stop_relay(args.port, quiet=True)
+            stop_ssh_relay(args.port, quiet=True)
+            stop_titan_ssh_relay(args.port, quiet=True)
             die("Relay is up but the gateway did not answer through it.")
         hostname = socket.gethostname()
         base_url = f"http://{hostname}:{args.port}"
-        say(f"  {OK} Relay published: {hostname}:{args.port} {DOT} {GATEWAY_HOST}:{GATEWAY_PORT}")
+        say(
+            f"  {OK} Relay published: {hostname}:{args.port} {DOT} {GATEWAY_HOST}:{GATEWAY_PORT}"
+        )
     elif use_tunnel:
         start_tunnel(args.port, api_key)
         base_url = f"http://127.0.0.1:{args.port}"
     else:
         base_url = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
         if not gateway_responds(GATEWAY_HOST, GATEWAY_PORT, api_key):
-            die(f"--direct requested but {GATEWAY_HOST}:{GATEWAY_PORT} is not answering.\n"
-                f"  Drop --direct (or pass --tunnel) to hop through {SSH_JUMP}.")
+            die(
+                f"--direct requested but {GATEWAY_HOST}:{GATEWAY_PORT} is not answering.\n"
+                f"  Drop --direct (or pass --tunnel) to hop through {SSH_JUMP}."
+            )
         say(f"  {OK} Using direct connection, no tunnel needed")
 
     if args.models:
