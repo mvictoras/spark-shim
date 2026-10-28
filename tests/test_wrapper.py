@@ -87,9 +87,9 @@ class WrapperTestCase(unittest.TestCase):
         env.update({k: str(v) for k, v in overrides.items()})
         return env
 
-    def run_wrapper(self, **env_overrides):
+    def run_wrapper(self, *wrapper_args, **env_overrides):
         return subprocess.run(
-            ["bash", str(self.symlink)],
+            ["bash", str(self.symlink), *wrapper_args],
             env=self.env(**env_overrides),
             cwd=str(self.link),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -156,6 +156,18 @@ class WrapperTestCase(unittest.TestCase):
         joined = " ".join(self.calls())
         self.assertIn("uvx argo-shim --opencode", joined)
         self.assertIn("--codex", joined)
+
+    def test_extra_flags_forwarded_to_spark_shim(self):
+        proc = self.run_wrapper("--no-hermes", TEST_WHERE="away")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_for_log("--codex")
+        joined = " ".join(self.calls())
+        # The main spark-shim step carries the flag ...
+        self.assertIn("spark-shim --no-hermes", joined)
+        # ... but the --where location probe does not.
+        self.assertIn("spark-shim --where", joined)
+        # The forwarded flag did not disturb the Argo steps.
+        self.assertIn("uvx argo-shim --opencode", joined)
 
     def test_runs_from_other_directory_through_symlink(self):
         # setUp already runs via a symlink from another directory; if

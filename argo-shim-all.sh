@@ -15,6 +15,10 @@
 # blocks the next. A stale argo-shim holding the port is replaced via
 # --restart. Run it from anywhere, including through the old
 # ~/scripts/argo-shim-all.sh symlink.
+#
+# Any extra flags are forwarded to the spark-shim step, e.g.
+#
+#   argo-shim-all.sh --no-hermes      # skip the Hermes provider and tunnel
 
 set -u
 
@@ -44,7 +48,9 @@ report() {
 mkdir -p "$STATE_DIR"
 
 # 1. Spark: location decision, client configs, stable address, Hermes tunnel.
-"$SPARK_SHIM" || report "spark-shim"
+#    Extra flags given to this wrapper are forwarded (e.g. --no-hermes,
+#    --gateway, --port) so the Spark step can be steered from the command line.
+"$SPARK_SHIM" "$@" || report "spark-shim"
 
 # 2. Argo, in the mode matching the location. --where prints the location;
 #    its exit code encodes it too (0 = lab, 1 = away), so success is judged
