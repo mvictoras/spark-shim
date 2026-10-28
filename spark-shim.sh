@@ -224,6 +224,22 @@ def apply_gateway(spec):
     GATEWAY_PORT = int(port) if port else DEFAULT_GATEWAY_PORT
 
 
+def tunnel_dest():
+    """Where the ssh-side end of the -L forward points.
+
+    Default is the gateway's loopback on the jump box (shortest path); a
+    --gateway override reroutes the far end to the configured host instead.
+    """
+    if GATEWAY_HOST != DEFAULT_GATEWAY_HOST:
+        return GATEWAY_HOST, GATEWAY_PORT
+    return REMOTE_BIND, GATEWAY_PORT
+
+
+def forward_spec(port):
+    dest_host, dest_port = tunnel_dest()
+    return f"{port}:{dest_host}:{dest_port}"
+
+
 # --- tunnel lifecycle -------------------------------------------------------
 
 

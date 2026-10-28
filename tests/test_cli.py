@@ -468,6 +468,168 @@ class CLITestCase(unittest.TestCase):
         self.assertNotIn("start_tunnel", names)
 
 
+class RelayOwnershipTestCase(unittest.TestCase):
+    """The relay's port discipline: reuse our own, never touch anyone else's."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="spark-shim-relay-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.mod = load_module(self.tmp)
+
+    def load(self):
+        mod = load_module(self.tmp)
+        fake_processes(mod, lab=True)
+        return mod
+
+    def test_healthy_relay_is_reused_not_duplicated(self):
+        import types
+
+        self.mod.loopback_relay_pids = lambda port: [123]
+        self.mod.gateway_responds = lambda *a, **k: True
+        spawn = Recorder()
+        self.mod.subprocess = types.SimpleNamespace(Popen=spawn, DEVNULL=-3)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.mod.start_loopback_relay(4100, "sk-test")
+        self.assertIn("Reusing existing relay", out.getvalue())
+        self.assertFalse(spawn.called)  # no second relay spawned
+
+    def test_ours_but_stale_relay_is_replaced(self):
+        import types
+
+        self.mod.loopback_relay_pids = lambda port: [123]
+        answers = [False, True]  # stale first, healthy after the replace
+
+        def fake_responds(*a, **k):
+            return answers.pop(0)
+
+        self.mod.gateway_responds = fake_responds
+        probes = []
+
+        def fake_port_open(host, port, timeout=3.0):
+            probes.append(1)
+            return len(probes) > 1  # not held, then listening
+
+        self.mod.port_open = fake_port_open
+        self.mod.stop_loopback_relay = Recorder(result=True)
+        spawn = Recorder()
+        self.mod.subprocess = types.SimpleNamespace(Popen=spawn, DEVNULL=-3)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.mod.start_loopback_relay(4100, "sk-test")
+        self.assertIn("stale, replacing it", out.getvalue())
+        self.assertIn((4100,), self.mod.stop_loopback_relay.calls)
+        self.assertTrue(spawn.called)
+
+    def test_foreign_holder_on_port_is_never_killed(self):
+        import types
+
+        self.mod.loopback_relay_pids = lambda port: []  # nothing of ours
+        self.mod.port_open = lambda *a, **k: True  # but the port is held
+        self.mod.port_holder = lambda port: "42 nobody evilproc"
+        spawn = Recorder()
+        self.mod.subprocess = types.SimpleNamespace(Popen=spawn, DEVNULL=-3)
+        killed = Recorder()
+        self.mod._signal_pid = killed
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod.start_loopback_relay(4100, "sk-test")
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertFalse(spawn.called)
+        self.assertFalse(killed.called)  # the holder is left alone
+
+    def test_gateway_override_changes_relay_far_end(self):
+        import types
+
+        self.mod.loopback_relay_pids = lambda port: []
+        probes = []
+
+        def fake_port_open(host, port, timeout=3.0):
+            probes.append(1)
+            return len(probes) > 1  # not held, then listening
+
+        self.mod.port_open = fake_port_open
+        self.mod.gateway_responds = lambda *a, **k: True
+        spawn = Recorder()
+        self.mod.subprocess = types.SimpleNamespace(Popen=spawn, DEVNULL=-3)
+        self.mod.apply_gateway("sparkmirror.example:5001")
+        self.mod.start_loopback_relay(4100, "sk-test")
+        cmd = spawn.args_of()[0]
+        self.assertIn("--gateway", cmd)
+        self.assertEqual(cmd[cmd.index("--gateway") + 1], "sparkmirror.example:5001")
+
+    def test_spark_gateway_env_changes_relay_far_end(self):
+        old = os.environ.get("SPARK_GATEWAY")
+        os.environ["SPARK_GATEWAY"] = "sparkmirror.example:5001"
+        self.addCleanup(os.environ.pop, "SPARK_GATEWAY", None)
+        if old is not None:
+            self.addCleanup(os.environ.__setitem__, "SPARK_GATEWAY", old)
+        mod = self.load()
+        mod.detect_direct = lambda api_key: True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with contextlib.suppress(SystemExit):
+                mod.main(["--where"])
+        self.assertEqual(out.getvalue().strip().splitlines()[-1], "lab")
+        self.assertIn("Gateway override: sparkmirror.example:5001", out.getvalue())
+        self.assertEqual(mod.GATEWAY_HOST, "sparkmirror.example")
+        self.assertEqual(mod.GATEWAY_PORT, 5001)
+
+
+class FarEndTestCase(unittest.TestCase):
+    """The ssh side of the stable address: what the -L forwards actually dial."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="spark-shim-farend-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_tunnel_far_end_defaults_to_titan_loopback(self):
+        mod = load_module(self.tmp)
+        self.assertEqual(
+            mod.tunnel_dest(), (mod.REMOTE_BIND, mod.DEFAULT_GATEWAY_PORT)
+        )
+        self.assertEqual(mod.forward_spec(4100), "4100:127.0.0.1:4000")
+
+    def test_gateway_override_reroutes_tunnel_far_end(self):
+        mod = load_module(self.tmp)
+        mod.apply_gateway("sparkmirror.example:5000")
+        self.assertEqual(mod.tunnel_dest(), ("sparkmirror.example", 5000))
+        self.assertEqual(mod.forward_spec(4100), "4100:sparkmirror.example:5000")
+
+    def test_away_tunnel_forwards_loopback_to_gateway_via_jump(self):
+        import types
+
+        mod = load_module(self.tmp)
+        mod.tunnel_pids = lambda port: []
+        probes = []
+
+        def fake_port_open(host, port, timeout=3.0):
+            probes.append((host, port))
+            return len(probes) > 1  # not held, then listening
+
+        mod.port_open = fake_port_open
+        mod.gateway_responds = lambda *a, **k: True
+        spawn = Recorder(result=types.SimpleNamespace(returncode=0))
+        mod.subprocess = types.SimpleNamespace(run=spawn, DEVNULL=-3)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mod.start_tunnel(4100, "sk-test")
+        cmd = " ".join(spawn.args_of()[0])
+        self.assertIn("127.0.0.1:4100:127.0.0.1:4000", cmd)
+        self.assertIn("login-gce", cmd)  # the hop comes from the script
+        self.assertIn("titan", cmd)  # ssh_config alias, not a hostname
+        self.assertIn("Opening tunnel 127.0.0.1:4100", out.getvalue())
+
+    def test_publish_relay_far_end_follows_the_gateway(self):
+        mod = load_module(self.tmp)
+        cmd = " ".join(mod.titan_ssh_relay_cmd(4100, batch=True))
+        self.assertIn("0.0.0.0:4100:127.0.0.1:4000", cmd)
+        self.assertIn("logins.cels.anl.gov", cmd)
+        mod.apply_gateway("sparkmirror.example:5000")
+        cmd = " ".join(mod.titan_ssh_relay_cmd(4100, batch=True))
+        self.assertIn("0.0.0.0:4100:sparkmirror.example:5000", cmd)
+
+
 class HermesHealthTestCase(unittest.TestCase):
     """The real health check: an HTTP response through the forward counts,
     a refusal or a silent close does not (the laptop-sleep leftover)."""
