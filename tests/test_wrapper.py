@@ -74,7 +74,7 @@ class WrapperTestCase(unittest.TestCase):
 
     def cleanup(self):
         # Kill any stubbed shim still sleeping in the background.
-        subprocess.run(["pkill", "-f", str(self.tmp)], capture_output=True)
+        subprocess.run(["pkill", "-f", str(self.tmp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def env(self, **overrides):
@@ -92,8 +92,8 @@ class WrapperTestCase(unittest.TestCase):
             ["bash", str(self.symlink)],
             env=self.env(**env_overrides),
             cwd=str(self.link),
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=30,
         )
 

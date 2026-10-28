@@ -253,8 +253,8 @@ def tunnel_pids(port):
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=5,
         ).stdout
     except Exception:
@@ -263,8 +263,8 @@ def tunnel_pids(port):
         try:
             args = subprocess.run(
                 ["ps", "-o", "args=", "-p", pid],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=5,
             ).stdout
         except Exception:
@@ -279,15 +279,15 @@ def port_holder(port):
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=5,
         ).stdout
         for pid in filter(None, (p.strip() for p in out.splitlines())):
             return subprocess.run(
                 ["ps", "-o", "pid=,user=,comm=", "-p", pid],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=5,
             ).stdout.strip()
     except Exception:
@@ -338,8 +338,8 @@ def loopback_relay_pids(port):
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=5,
         ).stdout
     except Exception:
@@ -348,8 +348,8 @@ def loopback_relay_pids(port):
         try:
             args = subprocess.run(
                 ["ps", "-o", "args=", "-p", pid],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=5,
             ).stdout
         except Exception:
@@ -530,8 +530,8 @@ def socat_pids(port):
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=5,
         ).stdout
     except Exception:
@@ -540,8 +540,8 @@ def socat_pids(port):
         try:
             args = subprocess.run(
                 ["ps", "-o", "args=", "-p", pid],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=5,
             ).stdout
         except Exception:
@@ -643,8 +643,8 @@ def ssh_relay_pids(port):
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=5,
         ).stdout
     except Exception:
@@ -654,8 +654,8 @@ def ssh_relay_pids(port):
         try:
             args = subprocess.run(
                 ["ps", "-o", "args=", "-p", pid],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=5,
             ).stdout
         except Exception:
@@ -686,8 +686,8 @@ def titan_ssh_relay_pids(port):
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=5,
         ).stdout
     except Exception:
@@ -698,8 +698,8 @@ def titan_ssh_relay_pids(port):
         try:
             args = subprocess.run(
                 ["ps", "-o", "args=", "-p", pid],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=5,
             ).stdout
         except Exception:
@@ -1083,8 +1083,8 @@ def hermes_tunnel_pids():
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{HERMES_TUNNEL_PORT}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=5,
         ).stdout
     except Exception:
@@ -1093,8 +1093,8 @@ def hermes_tunnel_pids():
         try:
             args = subprocess.run(
                 ["ps", "-o", "args=", "-p", pid],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=5,
             ).stdout
         except Exception:
