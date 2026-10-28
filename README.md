@@ -159,6 +159,21 @@ per-node SSH tunnel (see Security notes). Use the **short hostname**
 (`polaris-login-02`, not the FQDN) from compute nodes — split DNS on ALCF
 resolves the FQDN to an unrouteable address from there.
 
+**Compute nodes behind an HTTP proxy** (ALCF compute nodes get `http_proxy`
+from `/etc/profile.d` or a sourced `proxy.sh`): the relay's host must be
+exempted in `no_proxy`, and listed in *every* form a client may resolve it
+to. curl matches `no_proxy` entries literally, so the short name suffices;
+opencode's Bun runtime expands the short name through the search domains
+first and matches the expanded FQDN, so that flavor is needed too. Miss
+either and the proxy answers the request itself with a **502** — the relay
+and gateway are never reached:
+
+    export no_proxy="$no_proxy,aurora-uan-0009,aurora-uan-0009.hostmgmt.cm.aurora.alcf.anl.gov"
+
+On aurora the expanded name is the hostmgmt FQDN; on polaris it is
+`polaris-login-0X.hsn.cm.polaris.alcf.anl.gov`. Cover all login nodes your
+`--publish` might land on — `no_proxy` does not support wildcards.
+
 The relay is detached from the launching shell (survives logout), is reused
 if a healthy one is already on the port, and is stopped with
 `spark-shim --stop`. If the port is held by something else, pick another
