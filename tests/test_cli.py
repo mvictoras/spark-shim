@@ -139,13 +139,11 @@ class CLITestCase(unittest.TestCase):
         mod = self.load(lab=True)
         self.run_main(mod)
         models = read_json(self.opencode_config)["provider"]["spark"]["models"]
-        # Existing entry preserved byte-for-byte in meaning.
-        glm = models["glm-5.3-flash-exl3"]
+        # The pre-existing entry (limits and variants) is unchanged in meaning.
         self.assertEqual(
-            glm["variants"]["max"], {"reasoningEffort": "max"}
+            models["glm-5.3-flash-exl3"],
+            DEFAULT_OPENCODE["provider"]["spark"]["models"]["glm-5.3-flash-exl3"],
         )
-        self.assertEqual(glm["limit"]["context"], 1048576)
-        self.assertEqual(glm["name"], "GLM-5.3-Flash EXL3 (dual Spark, TP=2)")
         # New gateway models appear with minimal entries.
         for model_id in DISCOVERED_MODELS:
             self.assertIn(model_id, models)
@@ -177,7 +175,19 @@ class CLITestCase(unittest.TestCase):
         mod.roundtrip = fake_roundtrip
         out = self.run_main(mod, "--test")
         self.assertEqual(seen, ["glm-5.3-flash-exl3", "glm-5.3-flash-exl3"])
+        # Both wire protocols get a model the gateway actually serves; the
+        # old hard-coded names (spark/qwen3.8-27b, spark/gpt-oss-20b) never
+        # go out on the wire.
+        self.assertTrue(set(seen) <= set(DISCOVERED_MODELS))
         self.assertIn("Round-trip", out)
+
+    def test_rerun_with_unchanged_models_is_semantically_stable(self):
+        mod = self.load(lab=True)
+        self.run_main(mod)
+        first = read_json(self.opencode_config)
+        self.run_main(mod)  # same gateway list, same config: no semantic drift
+        second = read_json(self.opencode_config)
+        self.assertEqual(first, second)
 
     # -- Hermes managed block ------------------------------------------------
 
