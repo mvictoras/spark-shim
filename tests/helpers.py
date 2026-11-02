@@ -116,13 +116,15 @@ def load_module(home):
     return mod
 
 
-def fake_processes(mod, lab=True, fake_ensure_hermes=True):
+def fake_processes(mod, lab=True, fake_ensure_hermes=True, fake_master_close=True):
     """Fake the process-spawning and probe boundary of a loaded module.
 
     Default world: the probe says `lab`, nothing is running, every
     start/stop succeeds and is recorded on the module as `mod.events`.
     Pass fake_ensure_hermes=False to keep the real Hermes tunnel logic
     (its own seams — pids, health, spawning — stay patchable).
+    Pass fake_master_close=False to keep the real close_hermes_master
+    (its --O exit probe stays patchable through mod.subprocess).
     """
     mod.events = []
     mod.detect_direct = lambda api_key: lab
@@ -155,6 +157,8 @@ def fake_processes(mod, lab=True, fake_ensure_hermes=True):
     mod.stop_ssh_relay = record("stop_ssh_relay")
     mod.stop_titan_ssh_relay = record("stop_titan_ssh_relay")
     mod.stop_hermes_tunnel = record("stop_hermes_tunnel")
+    if fake_master_close:
+        mod.close_hermes_master = record("close_hermes_master")
 
     mod.gateway_responds = lambda *a, **k: True
     mod.fetch_models = lambda base_url, api_key: list(DISCOVERED_MODELS)

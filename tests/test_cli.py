@@ -47,9 +47,12 @@ class CLITestCase(unittest.TestCase):
         self.hermes_config.parent.mkdir(parents=True, exist_ok=True)
         self.hermes_config.write_text(DEFAULT_HERMES)
 
-    def load(self, lab=True, fake_ensure_hermes=True):
+    def load(self, lab=True, fake_ensure_hermes=True, fake_master_close=True):
         mod = load_module(self.tmp)
-        fake_processes(mod, lab=lab, fake_ensure_hermes=fake_ensure_hermes)
+        fake_processes(
+            mod, lab=lab, fake_ensure_hermes=fake_ensure_hermes,
+            fake_master_close=fake_master_close,
+        )
         return mod
 
     def run_main(self, mod, *argv):
@@ -353,6 +356,7 @@ class CLITestCase(unittest.TestCase):
             "stop_ssh_relay",
             "stop_titan_ssh_relay",
             "stop_hermes_tunnel",
+            "close_hermes_master",
         ):
             self.assertIn(expected, names)
 
@@ -415,7 +419,79 @@ class CLITestCase(unittest.TestCase):
             f"127.0.0.1:9119:vr09.alcf.anl.gov:9119", " ".join(cmd)
         )
         self.assertIn("login-gce", cmd)
-        self.assertIn("ControlMaster=no", cmd)  # dedicated, non-multiplexed
+        self.assertIn("ControlMaster=auto", cmd)
+        self.assertIn(f"ControlPath={mod.HERMES_MASTER_SOCKET}", cmd)
+        self.assertIn("ControlPersist=yes", cmd)  # dedicated mux master
+
+    def test_hermes_tunnel_mfa_failure_prints_bootstrap_hint(self):
+        import types
+
+        mod = self.load(lab=False, fake_ensure_hermes=False)
+        mod.hermes_tunnel_pids = lambda: []
+        mod.port_open = lambda host, port, timeout=3.0: False
+
+        def mfa_run(cmd, stdout=None, stderr=None, timeout=None):
+            mfa_run.cmd = cmd
+            stderr.write("Permission denied (keyboard-interactive).")
+            stderr.seek(0)
+            return types.SimpleNamespace(returncode=255)
+
+        mod.subprocess = types.SimpleNamespace(run=mfa_run, DEVNULL=-3)
+        out = self.run_main(mod)
+        self.assertIn("bootstrap", out.lower())
+        self.assertIn(f"ControlPath={mod.HERMES_MASTER_SOCKET}", out)
+        self.assertIn(f"-L 127.0.0.1:9119:vr09.alcf.anl.gov:9119", out)
+        self.assertIn("login-gce", out)
+
+    def test_hermes_tunnel_other_failure_no_mfa_hint(self):
+        import types
+
+        mod = self.load(lab=False, fake_ensure_hermes=False)
+        mod.hermes_tunnel_pids = lambda: []
+        mod.port_open = lambda host, port, timeout=3.0: False
+
+        def timeout_run(cmd, stdout=None, stderr=None, timeout=None):
+            stderr.write("Connection timed out during banner exchange.")
+            stderr.seek(0)
+            return types.SimpleNamespace(returncode=255)
+
+        mod.subprocess = types.SimpleNamespace(run=timeout_run, DEVNULL=-3)
+        out = self.run_main(mod)
+        self.assertIn("failed to open", out.lower())
+        self.assertNotIn("bootstrap", out.lower())
+
+    def test_close_hermes_master(self):
+        import os
+        import types
+
+        mod = self.load(lab=True, fake_master_close=False)
+        mod.HERMES_MASTER_SOCKET = str(self.tmp / "master-sock")
+        ok_spawn = Recorder(result=types.SimpleNamespace(returncode=0))
+        mod.subprocess = types.SimpleNamespace(run=ok_spawn, DEVNULL=-3)
+
+        # master alive: the socket file is there, ssh --O exit runs
+        open(mod.HERMES_MASTER_SOCKET, "w").close()
+        mod.close_hermes_master()
+        self.assertTrue(ok_spawn.called)
+        cmd = ok_spawn.args_of()[0]
+        self.assertEqual(
+            cmd[:5], ["ssh", "-S", mod.HERMES_MASTER_SOCKET, "-O", "exit"]
+        )
+
+        # master gone: no socket file, nothing to run
+        os.unlink(mod.HERMES_MASTER_SOCKET)
+        quiet_spawn = Recorder(result=types.SimpleNamespace(returncode=0))
+        mod.subprocess = types.SimpleNamespace(run=quiet_spawn, DEVNULL=-3)
+        mod.close_hermes_master()
+        self.assertFalse(quiet_spawn.called)
+
+        # stale socket: --O exit refuses; the dead file is unlinked
+        open(mod.HERMES_MASTER_SOCKET, "w").close()
+        stale_spawn = Recorder(result=types.SimpleNamespace(returncode=255))
+        mod.subprocess = types.SimpleNamespace(run=stale_spawn, DEVNULL=-3)
+        mod.close_hermes_master()
+        self.assertTrue(stale_spawn.called)
+        self.assertFalse(os.path.exists(mod.HERMES_MASTER_SOCKET))
 
     def test_hermes_tunnel_not_started_at_lab(self):
         import types

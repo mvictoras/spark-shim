@@ -88,8 +88,15 @@ GATEWAY_PORT = DEFAULT_GATEWAY_PORT
 # Hermes dashboard on the Windows box vr09: reachable from the lab directly,
 # off-site only through the CELS jump. spark-shim owns this tunnel (away
 # only); the wrapper no longer opens it.
+#
+# logins.cels now demands MFA on any fresh connection, which a backgrounded
+# tunnel cannot answer -- so the forward rides a dedicated ControlPersist
+# master: MFA is answered once, when the master is bootstrapped (the
+# command ensure_hermes_tunnel prints when the master is gone), and every
+# later tunnel start or sleep-scar replacement multiplexes through it.
 HERMES_TUNNEL_PORT = 9119
 HERMES_TUNNEL_HOST = "vr09.alcf.anl.gov"
+HERMES_MASTER_SOCKET = os.path.expanduser("~/.ssh/spark-shim-hermes")
 
 # CELS jump for hosts that cannot route to titan (ALCF compute-center
 # nodes): the same jump argo-shim uses for apps.inside.anl.gov, and the same
@@ -1127,8 +1134,13 @@ def hermes_tunnel_healthy():
 def hermes_tunnel_cmd():
     """The forward itself: 127.0.0.1:9119 -> vr09:9119 via login-gce.
 
-    A dedicated non-multiplexed connection, like the Spark tunnel -- sharing
-    the login-gce master would kill the dashboard whenever that master exits.
+    Carried by a dedicated ControlPersist master (HERMES_MASTER_SOCKET),
+    not the shared login-gce one: --stop and the Spark tunnel never hold
+    this connection hostage, and vice versa. With the master live the
+    forward opens with no auth at all; with it dead, a fresh connection
+    would demand MFA that BatchMode cannot answer -- ensure_hermes_tunnel
+    turns that failure into the bootstrap hint instead of deaf retries,
+    which is how a missed Duo push once escalated into an IP block.
     """
     return [
         "ssh",
@@ -1145,9 +1157,11 @@ def hermes_tunnel_cmd():
         "-o",
         "ServerAliveCountMax=3",
         "-o",
-        "ControlMaster=no",
+        "ControlMaster=auto",
         "-o",
-        "ControlPath=none",
+        f"ControlPath={HERMES_MASTER_SOCKET}",
+        "-o",
+        "ControlPersist=yes",
         "-L",
         f"127.0.0.1:{HERMES_TUNNEL_PORT}:{HERMES_TUNNEL_HOST}:{HERMES_TUNNEL_PORT}",
         SSH_JUMP,
@@ -1155,13 +1169,41 @@ def hermes_tunnel_cmd():
 
 
 def stop_hermes_tunnel(quiet=False):
-    """Stop our Hermes forward; True once nothing is listening on 9119."""
+    """Stop our Hermes forward; True once nothing is listening on 9119.
+
+    The dedicated master is deliberately NOT touched here: replacing a
+    dead forward must reuse the live master so no new auth happens. Only
+    --stop closes it, via close_hermes_master.
+    """
     pids = hermes_tunnel_pids()
     if not pids:
-        if not quiet:
+        ok = not port_open("127.0.0.1", HERMES_TUNNEL_PORT, timeout=1.0)
+        if not ok and not quiet:
             say(f"  No spark-shim Hermes tunnel on port {HERMES_TUNNEL_PORT}")
-        return not port_open("127.0.0.1", HERMES_TUNNEL_PORT, timeout=1.0)
+        return ok
     return _terminate_listeners(pids, HERMES_TUNNEL_PORT, quiet, "Hermes tunnel")
+
+
+def close_hermes_master():
+    """Exit the Hermes tunnel's ControlPersist master, if one is running.
+
+    --stop calls this after stop_hermes_tunnel: killing the forward would
+    otherwise leave the master connection alive on its own. A missing
+    socket is the normal no-master case; a stale socket file gets refused
+    by --O exit and is unlinked so the next bootstrap starts clean.
+    """
+    if not os.path.exists(HERMES_MASTER_SOCKET):
+        return
+    try:
+        result = subprocess.run(
+            ["ssh", "-S", HERMES_MASTER_SOCKET, "-O", "exit", SSH_JUMP],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            os.unlink(HERMES_MASTER_SOCKET)
+    except Exception:
+        pass
 
 
 def ensure_hermes_tunnel(location):
@@ -1209,6 +1251,20 @@ def ensure_hermes_tunnel(location):
             f"  {WARN} Hermes tunnel failed to open."
             + (f"\n  ssh said: {detail}" if detail else "")
         )
+        lowered = detail.lower()
+        if "keyboard-interactive" in lowered or "denied" in lowered:
+            say(
+                "\n"
+                f"    The master at {HERMES_MASTER_SOCKET} is gone and a fresh\n"
+                f"    connection to {SSH_JUMP} needs MFA, which the tunnel cannot\n"
+                f"    answer. Bootstrap it once in a terminal (answer the Duo\n"
+                f"    prompt; approve the push), then re-run spark-shim:\n"
+                f"      ssh -N -f -o ControlMaster=auto \\\n"
+                f"          -o ControlPath={HERMES_MASTER_SOCKET} \\\n"
+                f"          -o ControlPersist=yes \\\n"
+                f"          -L 127.0.0.1:{HERMES_TUNNEL_PORT}:{HERMES_TUNNEL_HOST}:{HERMES_TUNNEL_PORT} \\\n"
+                f"          {SSH_JUMP}\n"
+            )
         return
     say(f"  {OK} Hermes tunnel up: 127.0.0.1:{HERMES_TUNNEL_PORT} {DOT} {HERMES_TUNNEL_HOST}:{HERMES_TUNNEL_PORT}")
 
@@ -1724,6 +1780,7 @@ def main(argv=None):
         stop_ssh_relay(args.port)
         stop_titan_ssh_relay(args.port)
         stop_hermes_tunnel()
+        close_hermes_master()
         return
     if args.status:
         show_status(args.port, api_key, key_source)

@@ -76,10 +76,16 @@ spark-shim owns two Hermes things and nothing else:
   ordering, Hermes's own model config) is untouched. A timestamped backup is
   written before any change — and none when nothing changed.
 - the **vr09 dashboard tunnel** (away only): `127.0.0.1:9119 →
-  vr09.alcf.anl.gov:9119` through `login-gce`, on a dedicated
-  non-multiplexed connection. Health is judged by traffic through the
-  forward, so a listening-but-dead leftover from a laptop sleep is detected
-  and replaced. At the lab nothing is started and nothing is killed.
+  vr09.alcf.anl.gov:9119` through `login-gce`. Because logins.cels now
+  demands MFA on fresh connections — which a backgrounded tunnel cannot
+  answer — the forward rides a **dedicated ControlPersist master** at
+  `~/.ssh/spark-shim-hermes`. The master's Duo prompt is answered once,
+  by hand, using the `ssh …` command spark-shim prints when the master
+  is unexpectedly gone; every later start (and every laptop-sleep
+  recovery, where health is judged by traffic through the forward so a
+  listening-but-dead leftover is detected and replaced) multiplexes
+  through it with no new auth. `--stop` closes the master; nothing is
+  started or killed at the lab.
 
 Hermes's default model and its Argo provider entries are never touched.
 
