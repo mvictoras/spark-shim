@@ -85,18 +85,19 @@ DEFAULT_GATEWAY_PORT = 4000
 GATEWAY_HOST = DEFAULT_GATEWAY_HOST  # override with --gateway or $SPARK_GATEWAY
 GATEWAY_PORT = DEFAULT_GATEWAY_PORT
 
-# Hermes dashboard on the Windows box vr09: reachable from the lab directly,
-# off-site only through the CELS jump. spark-shim owns this tunnel (away
-# only); the wrapper no longer opens it.
-#
-# logins.cels now demands MFA on any fresh connection, which a backgrounded
-# tunnel cannot answer -- so the forward rides a dedicated ControlPersist
-# master: MFA is answered once, when the master is bootstrapped (the
-# command ensure_hermes_tunnel prints when the master is gone), and every
-# later tunnel start or sleep-scar replacement multiplexes through it.
 HERMES_TUNNEL_PORT = 9119
 HERMES_TUNNEL_HOST = "vr09.alcf.anl.gov"
-HERMES_MASTER_SOCKET = os.path.expanduser("~/.ssh/spark-shim-hermes")
+# The Hermes backend on vr09 is a python process bound to 127.0.0.1:9119 --
+# LOOPBACK ONLY -- so nothing outside the box can reach it, not even at the
+# lab. The only access is a tunnel to vr09's own sshd dialing its loopback;
+# away, that ssh rides the CELS jump (a fresh jump leg demands MFA, hence
+# the dedicated ControlPersist master).
+HERMES_TUNNEL_DEST = "mvictoras@vr09.alcf.anl.gov"
+HERMES_SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519_vr09")
+HERMES_MASTER_SOCKET = os.path.expanduser("~/.ssh/spark-shim-vr09")
+# hermes_tunnel_pids matches our ssh processes by a stable substring of
+# the destination; the spec covers the port mapping.
+DEST_HINT = "vr09.alcf.anl.gov"
 
 # CELS jump for hosts that cannot route to titan (ALCF compute-center
 # nodes): the same jump argo-shim uses for apps.inside.anl.gov, and the same
@@ -1086,7 +1087,7 @@ def hermes_tunnel_pids():
     Matched by the -L forward spec *and* the jump alias, like tunnel_pids.
     """
     pids = []
-    spec = f"127.0.0.1:{HERMES_TUNNEL_PORT}:{HERMES_TUNNEL_HOST}:{HERMES_TUNNEL_PORT}"
+    spec = f"127.0.0.1:{HERMES_TUNNEL_PORT}:127.0.0.1:{HERMES_TUNNEL_PORT}"
     try:
         out = subprocess.run(
             ["lsof", "-ti", f"TCP:{HERMES_TUNNEL_PORT}", "-sTCP:LISTEN"],
@@ -1106,7 +1107,7 @@ def hermes_tunnel_pids():
             ).stdout
         except Exception:
             continue
-        if "ssh" in args and spec in args and SSH_JUMP in args:
+        if "ssh" in args and spec in args and DEST_HINT in args:
             pids.append(int(pid))
     return pids
 
@@ -1131,18 +1132,20 @@ def hermes_tunnel_healthy():
         return False
 
 
-def hermes_tunnel_cmd():
-    """The forward itself: 127.0.0.1:9119 -> vr09:9119 via login-gce.
+def hermes_tunnel_cmd(via_jump=False):
+    """The forward itself: 127.0.0.1:9119 -> 127.0.0.1:9119 on vr09.
 
-    Carried by a dedicated ControlPersist master (HERMES_MASTER_SOCKET),
-    not the shared login-gce one: --stop and the Spark tunnel never hold
-    this connection hostage, and vice versa. With the master live the
-    forward opens with no auth at all; with it dead, a fresh connection
+    Targets vr09's sshd directly (loopback dial happens ON vr09), and --
+    when away -- hops through the CELS jump first. The connection rides a
+    dedicated ControlPersist master (HERMES_MASTER_SOCKET): at the lab
+    there is no MFA at all (key-only), away the single Duo happens when
+    the master is bootstrapped; after that every start or sleep-scar
+    replacement multiplexes through it silently. A fresh away connection
     would demand MFA that BatchMode cannot answer -- ensure_hermes_tunnel
     turns that failure into the bootstrap hint instead of deaf retries,
     which is how a missed Duo push once escalated into an IP block.
     """
-    return [
+    cmd = [
         "ssh",
         "-N",
         "-f",
@@ -1162,10 +1165,17 @@ def hermes_tunnel_cmd():
         f"ControlPath={HERMES_MASTER_SOCKET}",
         "-o",
         "ControlPersist=yes",
+        "-o",
+        f"IdentityFile={HERMES_SSH_KEY}",
+        "-o",
+        "IdentitiesOnly=yes",
         "-L",
-        f"127.0.0.1:{HERMES_TUNNEL_PORT}:{HERMES_TUNNEL_HOST}:{HERMES_TUNNEL_PORT}",
-        SSH_JUMP,
+        f"127.0.0.1:{HERMES_TUNNEL_PORT}:127.0.0.1:{HERMES_TUNNEL_PORT}",
     ]
+    if via_jump:
+        cmd += ["-J", SSH_JUMP]
+    cmd.append(HERMES_TUNNEL_DEST)
+    return cmd
 
 
 def stop_hermes_tunnel(quiet=False):
@@ -1214,12 +1224,6 @@ def ensure_hermes_tunnel(location):
     Away, a listening-but-dead forward owned by ssh is detected via the
     health check and replaced; a foreign holder of the port is left alone.
     """
-    if location != "away":
-        say(
-            f"  {DOT} Hermes dashboard reachable directly at the lab "
-            f"(no tunnel on port {HERMES_TUNNEL_PORT})"
-        )
-        return
     pids = hermes_tunnel_pids()
     if pids:
         if hermes_tunnel_healthy():
@@ -1242,7 +1246,8 @@ def ensure_hermes_tunnel(location):
 
     with tempfile.TemporaryFile(mode="w+") as errfile:
         returncode = subprocess.run(
-            hermes_tunnel_cmd(), stdout=subprocess.DEVNULL, stderr=errfile
+            hermes_tunnel_cmd(via_jump=(location == "away")),
+            stdout=subprocess.DEVNULL, stderr=errfile
         ).returncode
         errfile.seek(0)
         detail = errfile.read().strip()
@@ -1255,18 +1260,22 @@ def ensure_hermes_tunnel(location):
         if "keyboard-interactive" in lowered or "denied" in lowered:
             say(
                 "\n"
-                f"    The master at {HERMES_MASTER_SOCKET} is gone and a fresh\n"
-                f"    connection to {SSH_JUMP} needs MFA, which the tunnel cannot\n"
+                f"    The master at {HERMES_MASTER_SOCKET} is gone and the fresh\n"
+                f"    jump leg to {SSH_JUMP} needs MFA, which the tunnel cannot\n"
                 f"    answer. Bootstrap it once in a terminal (answer the Duo\n"
                 f"    prompt; approve the push), then re-run spark-shim:\n"
                 f"      ssh -N -f -o ControlMaster=auto \\\n"
-                f"          -o ControlPath={HERMES_MASTER_SOCKET} \\\n"
-                f"          -o ControlPersist=yes \\\n"
-                f"          -L 127.0.0.1:{HERMES_TUNNEL_PORT}:{HERMES_TUNNEL_HOST}:{HERMES_TUNNEL_PORT} \\\n"
-                f"          {SSH_JUMP}\n"
+                f"          -o ControlPath={HERMES_MASTER_SOCKET} -o ControlPersist=yes \\\n"
+                f"          -J {SSH_JUMP} \\\n"
+                f"          -L 127.0.0.1:{HERMES_TUNNEL_PORT}:127.0.0.1:{HERMES_TUNNEL_PORT} \\\n"
+                f"          {HERMES_TUNNEL_DEST}\n"
             )
         return
-    say(f"  {OK} Hermes tunnel up: 127.0.0.1:{HERMES_TUNNEL_PORT} {DOT} {HERMES_TUNNEL_HOST}:{HERMES_TUNNEL_PORT}")
+    say(
+        f"  {OK} Hermes tunnel up: 127.0.0.1:{HERMES_TUNNEL_PORT} {DOT} "
+        f"vr09:9119 via vr09 sshd"
+        + (f" (over the {SSH_JUMP} jump)" if location == "away" else "")
+    )
 
 
 # --- credentials ------------------------------------------------------------
@@ -1620,7 +1629,7 @@ def show_status(port, api_key, key_source):
         state = OK if healthy else f"{WARN} listening but not carrying traffic"
         say(
             f"  Hermes tunnel      {state} 127.0.0.1:{HERMES_TUNNEL_PORT} {DOT} "
-            f"{HERMES_TUNNEL_HOST}:{HERMES_TUNNEL_PORT} via {SSH_JUMP} "
+            f"vr09:9119 via vr09 sshd "
             f"(PID {', '.join(map(str, hermes))})"
         )
     else:

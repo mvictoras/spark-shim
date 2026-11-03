@@ -416,12 +416,42 @@ class CLITestCase(unittest.TestCase):
         self.assertTrue(spawn.called)
         cmd = spawn.args_of()[0]
         self.assertIn(
-            f"127.0.0.1:9119:vr09.alcf.anl.gov:9119", " ".join(cmd)
+            f"127.0.0.1:9119:127.0.0.1:9119", " ".join(cmd)
         )
-        self.assertIn("login-gce", cmd)
+        self.assertIn("mvictoras@vr09.alcf.anl.gov", cmd)
         self.assertIn("ControlMaster=auto", cmd)
         self.assertIn(f"ControlPath={mod.HERMES_MASTER_SOCKET}", cmd)
         self.assertIn("ControlPersist=yes", cmd)  # dedicated mux master
+        self.assertIn("-J", cmd)  # away: ride the CELS jump
+        self.assertIn(f"IdentityFile={mod.HERMES_SSH_KEY}", cmd)
+
+    def test_hermes_tunnel_away_jumps(self):
+        import types
+
+        mod = self.load(lab=False, fake_ensure_hermes=False)
+        mod.hermes_tunnel_pids = lambda: []
+        mod.port_open = lambda host, port, timeout=3.0: False
+        spawn = Recorder(result=types.SimpleNamespace(returncode=0))
+        mod.subprocess = types.SimpleNamespace(run=spawn, DEVNULL=-3)
+        self.run_main(mod)
+        self.assertTrue(spawn.called)
+        cmd = spawn.args_of()[0]
+        self.assertIn("mvictoras@vr09.alcf.anl.gov", cmd)
+        jump_at = cmd.index("-J")
+        self.assertEqual(cmd[jump_at + 1], "login-gce")
+        self.assertLess(jump_at, cmd.index("mvictoras@vr09.alcf.anl.gov"))
+
+    def test_hermes_tunnel_also_starts_at_lab(self):
+        import types
+
+        mod = self.load(lab=True, fake_ensure_hermes=False)
+        mod.hermes_tunnel_pids = lambda: []
+        mod.port_open = lambda host, port, timeout=3.0: False
+        spawn = Recorder(result=types.SimpleNamespace(returncode=0))
+        mod.subprocess = types.SimpleNamespace(run=spawn, DEVNULL=-3)
+        out = self.run_main(mod)
+        self.assertTrue(spawn.called)
+        self.assertNotIn("-J", spawn.args_of()[0])
 
     def test_hermes_tunnel_mfa_failure_prints_bootstrap_hint(self):
         import types
@@ -440,8 +470,9 @@ class CLITestCase(unittest.TestCase):
         out = self.run_main(mod)
         self.assertIn("bootstrap", out.lower())
         self.assertIn(f"ControlPath={mod.HERMES_MASTER_SOCKET}", out)
-        self.assertIn(f"-L 127.0.0.1:9119:vr09.alcf.anl.gov:9119", out)
-        self.assertIn("login-gce", out)
+        self.assertIn(f"-L 127.0.0.1:9119:127.0.0.1:9119", out)
+        self.assertIn("-J login-gce", out)
+        self.assertIn("mvictoras@vr09.alcf.anl.gov", out)
 
     def test_hermes_tunnel_other_failure_no_mfa_hint(self):
         import types
@@ -493,7 +524,7 @@ class CLITestCase(unittest.TestCase):
         self.assertTrue(stale_spawn.called)
         self.assertFalse(os.path.exists(mod.HERMES_MASTER_SOCKET))
 
-    def test_hermes_tunnel_not_started_at_lab(self):
+    def test_hermes_tunnel_healthy_leftover_reused_at_lab(self):
         import types
 
         mod = self.load(lab=True, fake_ensure_hermes=False)

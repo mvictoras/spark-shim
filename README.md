@@ -75,17 +75,23 @@ spark-shim owns two Hermes things and nothing else:
   known). Re-runs replace the block; the rest of the file (comments,
   ordering, Hermes's own model config) is untouched. A timestamped backup is
   written before any change — and none when nothing changed.
-- the **vr09 dashboard tunnel** (away only): `127.0.0.1:9119 →
-  vr09.alcf.anl.gov:9119` through `login-gce`. Because logins.cels now
-  demands MFA on fresh connections — which a backgrounded tunnel cannot
-  answer — the forward rides a **dedicated ControlPersist master** at
-  `~/.ssh/spark-shim-hermes`. The master's Duo prompt is answered once,
-  by hand, using the `ssh …` command spark-shim prints when the master
-  is unexpectedly gone; every later start (and every laptop-sleep
-  recovery, where health is judged by traffic through the forward so a
-  listening-but-dead leftover is detected and replaced) multiplexes
-  through it with no new auth. `--stop` closes the master; nothing is
-  started or killed at the lab.
+- the **vr09 dashboard tunnel** (lab and away): `127.0.0.1:9119 →
+  127.0.0.1:9119 on vr09`. The Hermes backend on vr09 is a python process
+  bound to **loopback only**, so *nothing outside the box* — not even a
+  Mac at the lab — can reach it directly; the only access is a tunnel to
+  vr09's sshd (key-only, user `mvictoras`) dialing the box's own
+  loopback. Away, the ssh rides the CELS jump (`-J login-gce`): the
+  single Duo happens when the jump master is bootstrapped, after which
+  every start and every laptop-sleep recovery multiplexes through the
+  dedicated ControlPersist master at `~/.ssh/spark-shim-vr09` with no
+  new auth. At the lab the same tunnel runs jump-free. If the away
+  master is unexpectedly gone, spark-shim prints the exact bootstrap
+  command instead of failing blindly — retry loops that made a missed
+  Duo push escalate into an IP block are what killed the old design.
+  Health is judged by traffic through the forward, so a
+  listening-but-dead leftover stays detected and replaced; a foreign
+  holder of the port is left alone. `--stop` closes the master too;
+  a missing socket is a no-op and a stale one is unlinked.
 
 Hermes's default model and its Argo provider entries are never touched.
 
