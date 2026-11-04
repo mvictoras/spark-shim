@@ -53,6 +53,7 @@ Usage:
 
 import argparse
 import copy
+import errno
 import getpass
 import json
 import os
@@ -163,13 +164,118 @@ def die(msg, code=1):
 # --- reachability -----------------------------------------------------------
 
 
-def port_open(host, port, timeout=3.0):
-    """True if a TCP connection to host:port completes."""
+def connect_error(host, port, timeout=3.0):
+    """None if a TCP connection to host:port completes, else its errno (-1 if none)."""
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
+            return None
+    except OSError as exc:
+        return exc.errno if exc.errno is not None else -1
+
+
+def port_open(host, port, timeout=3.0):
+    """True if a TCP connection to host:port completes."""
+    return connect_error(host, port, timeout) is None
+
+
+def warn(msg=""):
+    """Print to stderr: for warnings that must not pollute parsed stdout (--where)."""
+    print(msg, file=sys.stderr, flush=True)
+
+
+# --- macOS Local Network privacy --------------------------------------------
+# macOS blocks programs it hasn't been granted "Local Network" access from
+# reaching hosts on the Mac's own subnet. At the lab the Mac and titan share
+# 140.221.17.0/24, so a pyenv or Homebrew python gets EHOSTUNREACH ("No route
+# to host") while Apple's own binaries (curl, /usr/bin/python3) connect fine.
+# Left alone, that silently turns the lab into "away" depending on which
+# python3 the shebang resolves to -- i.e. on the current directory under pyenv.
+
+SYSTEM_PYTHON = "/usr/bin/python3"
+SYSTEM_CURL = "/usr/bin/curl"
+REEXEC_ENV = "SPARK_SHIM_REEXECED"
+
+# The argv main() was invoked with, so a re-exec can replay it.
+_ARGV = []
+
+
+def system_can_connect(host, port):
+    """True if Apple's own curl can open a TCP connection to host:port.
+
+    curl exits 6 (DNS), 7 (connect refused/unreachable) or 28 (timeout) when
+    no connection was made; any other code means the TCP connect succeeded,
+    whatever the HTTP layer did afterwards.
+    """
+    if not os.path.exists(SYSTEM_CURL):
         return False
+    try:
+        rc = subprocess.run(
+            [SYSTEM_CURL, "-s", "-o", "/dev/null", "--noproxy", "*",
+             "--connect-timeout", "3", "-m", "5", f"http://{host}:{port}/"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).returncode
+    except Exception:
+        return False
+    return rc not in (6, 7, 28)
+
+
+def local_network_blocked(host, port, err):
+    """True when connect error `err` is macOS Local Network privacy, not the network."""
+    return (
+        sys.platform == "darwin"
+        and err == errno.EHOSTUNREACH
+        and system_can_connect(host, port)
+    )
+
+
+def system_python_usable():
+    """True if /usr/bin/python3 is a real interpreter, not the CLT install stub."""
+    if not os.path.exists(SYSTEM_PYTHON):
+        return False
+    try:
+        return subprocess.run(
+            ["xcode-select", "-p"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
+def exec_replace(path, argv, env):
+    """os.execve, as a seam: replaces this process and never returns."""
+    os.execve(path, argv, env)
+
+
+def handle_local_network_block(host, port):
+    """Re-run under Apple's python (which macOS lets through), or explain the fix.
+
+    Re-exec happens at most once (guarded by REEXEC_ENV). It also matters for
+    the lab relay: it is spawned with sys.executable, so only a permitted
+    interpreter can carry traffic to the gateway. Warnings go to stderr so
+    `--where` keeps printing exactly "lab"/"away" on stdout.
+    """
+    warn(
+        f"  {WARN} macOS Local Network privacy is blocking {sys.executable} "
+        f"from {host}:{port}\n"
+        f"    (Apple's curl reaches it, so the network is fine; this python "
+        f"has no Local Network permission)"
+    )
+    if not os.environ.get(REEXEC_ENV) and system_python_usable():
+        warn(f"  {DOT} Re-running under {SYSTEM_PYTHON}, which macOS allows")
+        env = dict(os.environ)
+        env[REEXEC_ENV] = "1"
+        exec_replace(
+            SYSTEM_PYTHON,
+            [SYSTEM_PYTHON, os.path.abspath(__file__)] + list(_ARGV),
+            env,
+        )
+    warn(
+        "    Fix: System Settings > Privacy & Security > Local Network, enable\n"
+        "    this python (and opencode), or run spark-shim with /usr/bin/python3.\n"
+        "    Treating the gateway as unreachable (away path)."
+    )
 
 
 def gateway_responds(host, port, api_key, timeout=8):
@@ -193,7 +299,10 @@ def gateway_responds(host, port, api_key, timeout=8):
 
 def detect_direct(api_key):
     """True when the gateway is reachable without a tunnel (i.e. on ALCF net)."""
-    if not port_open(GATEWAY_HOST, GATEWAY_PORT, timeout=3.0):
+    err = connect_error(GATEWAY_HOST, GATEWAY_PORT, timeout=3.0)
+    if err is not None:
+        if local_network_blocked(GATEWAY_HOST, GATEWAY_PORT, err):
+            handle_local_network_block(GATEWAY_HOST, GATEWAY_PORT)  # may re-exec
         return False
     return gateway_responds(GATEWAY_HOST, GATEWAY_PORT, api_key)
 
@@ -1348,7 +1457,30 @@ def update_opencode(base_url, api_key, discovered=()):
         json.dump(cfg, fh, indent=2)
         fh.write("\n")
     say(f"  {OK} opencode   provider.spark.baseURL {DOT} {base_url}/v1")
+    running = opencode_pids()
+    if running:
+        say(
+            f"  {WARN} OpenCode is running (PID {', '.join(map(str, running))}). "
+            "It can write the config it\n"
+            "    loaded back over this file, undoing the change. Quit every "
+            "OpenCode process\n"
+            "    (including `opencode serve`), then re-run spark-shim."
+        )
     return merged
+
+
+def opencode_pids():
+    """PIDs of running OpenCode processes (TUI or `opencode serve`), [] if none."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-x", "opencode"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+            timeout=5,
+        ).stdout
+    except Exception:
+        return []
+    return [int(p) for p in out.split() if p.isdigit()]
 
 
 def strip_managed_block(text, begin, end):
@@ -1588,10 +1720,12 @@ def _configured_urls():
 
 
 def show_status(port, api_key, key_source):
+    # Probe first: it may re-exec (macOS Local Network block), and anything
+    # printed before that would be printed twice.
+    direct = detect_direct(api_key)
     say("spark-shim status\n")
     say(f"  API key source     {key_source}")
 
-    direct = detect_direct(api_key)
     location = "lab" if direct else "away"
     say(
         f"  Location           {location} "
@@ -1689,6 +1823,8 @@ def show_status(port, api_key, key_source):
 
 
 def main(argv=None):
+    global _ARGV
+    _ARGV = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         prog="spark-shim",
         description="Reach the DGX LiteLLM gateway on titan from anywhere.",
@@ -1766,7 +1902,11 @@ def main(argv=None):
     if gateway_spec:
         apply_gateway(gateway_spec)
         if not args._relay:
-            say(f"  {DOT} Gateway override: {GATEWAY_HOST}:{GATEWAY_PORT}")
+            # stderr under --where: the wrapper parses its stdout as exactly
+            # "lab"/"away", and $SPARK_GATEWAY alone would break that match.
+            (warn if args.where else say)(
+                f"  {DOT} Gateway override: {GATEWAY_HOST}:{GATEWAY_PORT}"
+            )
 
     # Hidden relay mode: block forever forwarding to the gateway endpoint.
     # No key, no config writes -- this process IS the stable address.

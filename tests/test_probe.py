@@ -9,6 +9,7 @@ single probe the connect path uses.
 """
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -16,6 +17,7 @@ import shutil
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler
 
 try:
@@ -159,6 +161,101 @@ class ProbeTestCase(unittest.TestCase):
         srv2, _ = self.start_gateway(valid_key="sk-other")
         self.point_probe_at("127.0.0.1", srv2.server_address[1])
         self.assertEqual(self.run_where(), ("away", 1))
+
+
+class Reexeced(Exception):
+    """Raised by the fake exec seam: a real execve never returns."""
+
+
+class LocalNetworkBlockTestCase(unittest.TestCase):
+    """macOS Local Network privacy: EHOSTUNREACH for us, but Apple's curl connects.
+
+    Seams faked: the TCP connect (connect_error), the curl cross-check, the
+    /usr/bin/python3 availability check and the exec itself. The platform is
+    pinned to darwin so the tests run the same on Linux CI.
+    """
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp(prefix="spark-shim-lnp-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.mod = load_module(tmp)
+        self.mod.connect_error = lambda *a, **k: errno.EHOSTUNREACH
+        self.mod.system_can_connect = lambda host, port: True
+        self.mod.system_python_usable = lambda: True
+        self.execs = []
+
+        def fake_exec(path, argv, env):
+            self.execs.append((path, argv, env))
+            raise Reexeced()
+
+        self.mod.exec_replace = fake_exec
+        patcher = mock.patch.object(self.mod.sys, "platform", "darwin")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"SPARK_API_KEY": "sk-test"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(self.mod.REEXEC_ENV, None)
+
+    def run_where(self):
+        out, err = io.StringIO(), io.StringIO()
+        code = None
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                self.mod.main(["--where", "--gateway", "titan.example:4000"])
+            except SystemExit as exc:
+                code = exc.code
+        return out.getvalue(), err.getvalue(), code
+
+    def test_block_reexecs_under_system_python_with_same_argv(self):
+        with self.assertRaises(Reexeced):
+            self.run_where()
+        self.assertEqual(len(self.execs), 1)
+        path, argv, env = self.execs[0]
+        self.assertEqual(path, self.mod.SYSTEM_PYTHON)
+        self.assertEqual(argv[0], self.mod.SYSTEM_PYTHON)
+        self.assertTrue(argv[1].endswith("spark-shim.sh"))
+        self.assertEqual(argv[2:], ["--where", "--gateway", "titan.example:4000"])
+        self.assertEqual(env[self.mod.REEXEC_ENV], "1")
+
+    def test_block_after_reexec_warns_on_stderr_and_keeps_where_parseable(self):
+        # Already re-exec'd once (or no usable system python): no loop, a
+        # clear explanation on stderr, and stdout is still exactly "away" --
+        # the wrapper parses it.
+        os.environ[self.mod.REEXEC_ENV] = "1"
+        out, err, code = self.run_where()
+        self.assertEqual(self.execs, [])
+        self.assertEqual(out.strip(), "away")
+        self.assertEqual(code, 1)
+        self.assertIn("Local Network", err)
+
+    def test_no_system_python_warns_instead_of_reexec(self):
+        self.mod.system_python_usable = lambda: False
+        out, err, code = self.run_where()
+        self.assertEqual(self.execs, [])
+        self.assertEqual(out.strip(), "away")
+        self.assertIn("Privacy & Security", err)
+
+    def test_genuinely_unreachable_is_plain_away(self):
+        # curl can't connect either: really off-site, no warning, no exec.
+        self.mod.system_can_connect = lambda host, port: False
+        out, err, code = self.run_where()
+        self.assertEqual(self.execs, [])
+        self.assertEqual((out.strip(), code), ("away", 1))
+        self.assertNotIn("Local Network", err)
+
+    def test_only_ehostunreach_on_macos_counts(self):
+        calls = []
+        self.mod.system_can_connect = lambda h, p: calls.append((h, p)) or True
+        self.assertFalse(
+            self.mod.local_network_blocked("h", 1, errno.ECONNREFUSED)
+        )
+        with mock.patch.object(self.mod.sys, "platform", "linux"):
+            self.assertFalse(
+                self.mod.local_network_blocked("h", 1, errno.EHOSTUNREACH)
+            )
+        self.assertEqual(calls, [])  # curl is never spawned for these
+        self.assertTrue(self.mod.local_network_blocked("h", 1, errno.EHOSTUNREACH))
 
 
 if __name__ == "__main__":

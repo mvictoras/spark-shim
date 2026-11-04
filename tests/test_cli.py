@@ -78,6 +78,19 @@ class CLITestCase(unittest.TestCase):
         self.assertIn("http://127.0.0.1:4100/v1", self.hermes_config.read_text())
         self.assertIn("Restart OpenCode and Hermes", out)
 
+    def test_running_opencode_triggers_overwrite_warning(self):
+        # A live OpenCode can write its loaded config back over ours.
+        mod = self.load()
+        mod.opencode_pids = lambda: [16586, 57720]
+        out = self.run_main(mod)
+        self.assertIn("OpenCode is running (PID 16586, 57720)", out)
+        self.assertIn("opencode serve", out)
+
+    def test_no_opencode_warning_when_not_running(self):
+        mod = self.load()
+        out = self.run_main(mod)
+        self.assertNotIn("OpenCode is running", out)
+
     def test_lab_uses_relay_and_stable_address(self):
         mod = self.load(lab=True)
         self.run_main(mod)
@@ -673,12 +686,14 @@ class RelayOwnershipTestCase(unittest.TestCase):
             self.addCleanup(os.environ.__setitem__, "SPARK_GATEWAY", old)
         mod = self.load()
         mod.detect_direct = lambda api_key: True
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             with contextlib.suppress(SystemExit):
                 mod.main(["--where"])
-        self.assertEqual(out.getvalue().strip().splitlines()[-1], "lab")
-        self.assertIn("Gateway override: sparkmirror.example:5001", out.getvalue())
+        # stdout is exactly the location (the wrapper matches it verbatim);
+        # the override notice goes to stderr.
+        self.assertEqual(out.getvalue(), "lab\n")
+        self.assertIn("Gateway override: sparkmirror.example:5001", err.getvalue())
         self.assertEqual(mod.GATEWAY_HOST, "sparkmirror.example")
         self.assertEqual(mod.GATEWAY_PORT, 5001)
 

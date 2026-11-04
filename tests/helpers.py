@@ -160,6 +160,7 @@ def fake_processes(mod, lab=True, fake_ensure_hermes=True, fake_master_close=Tru
     if fake_master_close:
         mod.close_hermes_master = record("close_hermes_master")
 
+    mod.opencode_pids = lambda: []
     mod.gateway_responds = lambda *a, **k: True
     mod.fetch_models = lambda base_url, api_key: list(DISCOVERED_MODELS)
     return mod

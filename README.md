@@ -23,6 +23,10 @@ the Spark path, the Hermes dashboard tunnel and the `argo-shim-all.sh`
 wrapper. Away, spark-shim also keeps a tunnel to the Hermes dashboard on the
 Windows box vr09 (`127.0.0.1:9119`); at the lab vr09 is reached without one.
 
+On a Mac, a failed connect is cross-checked before it counts as "away": if
+macOS Local Network privacy is what blocked it, spark-shim re-runs itself
+under Apple's python (see [Troubleshooting](#troubleshooting)).
+
 `titan` and `login-gce` are ssh_config aliases, not hostnames. Usernames and
 keys live in `~/.ssh/config`. The `titan` alias itself carries no ProxyJump —
 the off-site tunnel passes `-J login-gce` explicitly, so that hop is supplied
@@ -53,7 +57,13 @@ path doesn't match the detected location.
 `--port` overrides the port (default 4100, or `$SPARK_SHIM_PORT`).
 
 After rewriting configs, spark-shim reminds you to restart OpenCode and
-Hermes — a running session keeps the old config.
+Hermes — a running session keeps the old config. If OpenCode is running at
+that moment it also warns, with the PIDs: a live OpenCode can write the config
+it loaded back over `opencode.json` and undo the change.
+
+`--where` prints exactly `lab` or `away` on stdout and nothing else; notices
+(gateway override, Local Network warnings) go to stderr. Scripts can rely on
+`where=$(spark-shim --where 2>/dev/null)`.
 
 ## The lab relay
 
@@ -63,6 +73,11 @@ forwarding to the gateway endpoint (honouring `--gateway`). No socat, no
 ssh, no keys. It is this script re-invoked in a hidden relay mode, and it is
 found, health-checked and stopped by matching its own listen spec in the
 process arguments — the same discipline the ssh tunnels use.
+
+The relay runs under the same python that launched spark-shim. On a Mac that
+python needs Local Network access to reach titan, which is why spark-shim
+switches to `/usr/bin/python3` when the probe finds it blocked, before the
+relay is started.
 
 ## Hermes
 
@@ -109,6 +124,11 @@ block Spark, and each step's failure is reported without skipping the rest.
   then `argo-shim --restart --codex --port 17950` in the background with a
   log in the state directory. A stale shim holding 17950 is replaced via
   `--restart`.
+
+The wrapper decides the location with `spark-shim --where` and matches its
+stdout literally, which is why `--where` keeps notices on stderr. The Argo
+shim's output, including its SSH lockout messages, goes to
+`~/.cache/spark-shim/argo-shim.log`.
 
 The Hermes tunnel line the old wrapper had is gone — spark-shim owns it.
 
@@ -198,6 +218,13 @@ Resolution order: `$SPARK_API_KEY`, then
 `provider.spark.options.headers.Authorization` in
 `~/.config/opencode/opencode.json`, then the built-in default.
 
+In `opencode.json` the key is stored as a full header value,
+`"Authorization": "Bearer sk-…"`, not as an `apiKey` field. To test it by hand
+without printing it:
+
+    KEY=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.config/opencode/opencode.json')))['provider']['spark']['options']['headers']['Authorization'])")
+    curl -s -H "Authorization: $KEY" http://127.0.0.1:4100/v1/models
+
 ## Client configuration
 
 - **opencode**: `provider.spark.options.baseURL` -> `http://127.0.0.1:4100/v1`
@@ -221,6 +248,8 @@ Resolution order: `$SPARK_API_KEY`, then
   wrapper exports it).
 - `SPARK_TITAN_USER` — titan ssh username for the publish relay (defaults to
   local user).
+- `SPARK_SHIM_REEXECED` — internal. Set when spark-shim re-runs itself under
+  `/usr/bin/python3`, so it does so at most once. Don't set it yourself.
 
 ## Security notes
 
@@ -248,6 +277,91 @@ stub executables, and the relay against a local echo server.
 - python 3 (stdlib only)
 - `socat` for `--publish` when the gateway is directly routable
 - `ssh` and `lsof` for the off-site tunnel mode and the publish ssh relays
+
+- macOS: the Xcode Command Line Tools (`xcode-select --install`), so
+  `/usr/bin/python3` is a real interpreter for the Local Network fallback
+
+## Troubleshooting
+
+### Quick health check
+
+    spark-shim --status        # location, what's listening, configured addresses
+    spark-shim --test          # real round-trip on both wire protocols
+    tail ~/.cache/spark-shim/argo-shim.log   # the Argo side
+
+In `--status`, the **Client configuration** lines should show
+`http://127.0.0.1:4100/v1` for both opencode and hermes (or
+`<login-node>:4100` after `--publish`). Anything else means a client is
+bypassing the stable address.
+
+### Spark works from the shell but a client fails (macOS Local Network privacy)
+
+**Symptom.** At the lab, `curl` to the gateway works, but a Python script or
+OpenCode gets `No route to host` (errno 65, `EHOSTUNREACH`). On older
+versions of spark-shim, `--where` or `--status` said **away** at the lab, and
+the answer changed with the directory you ran it from.
+
+**Cause.** At the lab your Mac and titan are on the same subnet
+(140.221.17.0/24). macOS blocks programs that haven't been granted "Local
+Network" access from reaching hosts on the local subnet. Apple's own binaries
+(`curl`, `/usr/bin/python3`) are allowed; a pyenv or Homebrew python usually
+isn't, and neither is a Homebrew `opencode`. Under pyenv the directory
+matters: `~/.python-version` selects pyenv's python for everything under your
+home directory, while elsewhere (`/tmp`) `python3` may resolve to Apple's.
+
+**What spark-shim does.** When its connect fails with `EHOSTUNREACH` on
+macOS, it checks with Apple's `curl`. If curl gets through, it prints a
+warning on stderr and re-runs itself once under `/usr/bin/python3`, so the
+location check and the lab relay work whichever `python3` the shebang finds.
+If `/usr/bin/python3` isn't usable (no Command Line Tools), it explains the
+fix and treats the gateway as unreachable.
+
+**What you do.** Keep every client pointed at `127.0.0.1:4100`. Loopback
+isn't affected by the block, and the relay behind it runs under an allowed
+python. Pointing OpenCode straight at `titan.alcf.anl.gov:4000` is what
+fails. To grant access instead, use System Settings > Privacy & Security >
+Local Network; command-line programs that aren't app bundles don't always
+appear there.
+
+To check an interpreter yourself:
+
+    python3 -c "import socket; socket.create_connection(('titan.alcf.anl.gov', 4000), 3); print('ok')"
+
+### OpenCode's config keeps reverting to titan
+
+**Symptom.** spark-shim reports `provider.spark.baseURL → http://127.0.0.1:4100/v1`,
+but `--status` later shows opencode at `http://titan.alcf.anl.gov:4000/v1`,
+and `opencode.json`'s modification time is after the spark-shim run.
+
+**Cause.** A running OpenCode (the TUI, or the background
+`opencode serve --service`) can write the config it loaded back to
+`~/.config/opencode/opencode.json`. Combined with the Local Network block
+above, that leaves OpenCode unable to reach Spark.
+
+**Fix.** Quit every OpenCode process, re-run spark-shim (or the wrapper),
+then start OpenCode again. spark-shim warns when it finds OpenCode running
+during the rewrite.
+
+    pgrep -lx opencode         # anything listed must be quit first
+
+### The gateway reports `"db": "Not connected"`
+
+`curl http://titan.alcf.anl.gov:4000/health/readiness` may show
+`{"status":"healthy","db":"Not connected"}`. On its own this is not the
+problem: keys still authenticate and `/v1/models` still answers. Test with a
+real key (see [API key](#api-key)) before blaming the gateway. A request sent
+with a missing or malformed key gets an auth error or `No connected db.`,
+which looks like a gateway fault but isn't.
+
+### SSH lockout messages in the Argo log
+
+`~/.cache/spark-shim/argo-shim.log` accumulates across runs, so it may show
+`could not establish the SSH tunnel` and a 15-minute cooldown from an earlier
+**away** run. At the lab the wrapper runs Argo in direct mode with no SSH at
+all, and those lines don't apply. Check the last
+`argo-shim-all: at the lab` / `away` line printed by the wrapper to see which
+mode is current. Away, don't keep restarting while the cooldown is active:
+repeated failed logins can get the shared login node's IP blocked.
 
 ## Layout
 
